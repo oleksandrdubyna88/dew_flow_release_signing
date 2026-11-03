@@ -363,8 +363,8 @@ $cases = @(
      Expect = @('kept vendor file vendor.dat: Valid'); Outputs = @{ count = '1'; 'kept-count' = '2' } }
   @{ Id = 'A.text'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/notes.txt' = 'text:hello' }); Exit = 0; Outputs = @{ count = '1'; 'kept-count' = '1' } }
   # C: the package folder name has no leading dash (7z would read it as a switch) and no comma (the signing action splits on it).
-  @{ Id = 'C.dash'; Step = 'pkg'; Tree = [ordered]@{ 'in/-x' = '<dir>' }; Exit = 1; Expect = @("package folder name '-x'"); NoOutput = $true }
-  @{ Id = 'C.comma'; Step = 'pkg'; Tree = [ordered]@{ 'in/a,b' = '<dir>' }; Exit = 1; Expect = @("package folder name 'a,b'"); NoOutput = $true }
+  @{ Id = 'C.dash'; Step = 'pkg'; Tree = [ordered]@{ 'in/-x' = '<dir>' }; Exit = 1; Expect = @("package folder name '-x'", 'start with a letter or digit; use only letters, digits, ''.'', ''_'' and ''-'' (no spaces, commas or a leading ''-'')'); NoOutput = $true }
+  @{ Id = 'C.comma'; Step = 'pkg'; Tree = [ordered]@{ 'in/a,b' = '<dir>' }; Exit = 1; Expect = @("package folder name 'a,b'", 'start with a letter or digit; use only letters, digits, ''.'', ''_'' and ''-'' (no spaces, commas or a leading ''-'')'); NoOutput = $true }
   # E: more than 200 files to sign is one finding (the list travels through an environment variable).
   @{ Id = 'E.201'; Step = 'inventory'; Tree = (With-Tree -Add $manyExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 1; Expect = @('more than 200 files to sign'); NoOutput = $true }
   @{ Id = 'E.200'; Step = 'inventory'; Tree = (With-Tree -Add $fewExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 0; Outputs = @{ count = '200' } }
