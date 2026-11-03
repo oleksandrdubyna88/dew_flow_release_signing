@@ -316,6 +316,9 @@ $cases = @(
   @{ Id = 'A.kept'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/vendor.dat' = 'vendor.exe' }); Exit = 0
      Expect = @('kept vendor file vendor.dat: Valid'); Outputs = @{ count = '1'; 'kept-count' = '2' } }
   @{ Id = 'A.text'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/notes.txt' = 'text:hello' }); Exit = 0; Outputs = @{ count = '1'; 'kept-count' = '1' } }
+  # C: the package folder name has no leading dash (7z would read it as a switch) and no comma (the signing action splits on it).
+  @{ Id = 'C.dash'; Step = 'pkg'; Tree = [ordered]@{ 'in/-x' = '<dir>' }; Exit = 1; Expect = @("package folder name '-x'"); NoOutput = $true }
+  @{ Id = 'C.comma'; Step = 'pkg'; Tree = [ordered]@{ 'in/a,b' = '<dir>' }; Exit = 1; Expect = @("package folder name 'a,b'"); NoOutput = $true }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
