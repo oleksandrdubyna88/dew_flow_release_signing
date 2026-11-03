@@ -19,7 +19,8 @@ artifact `unsigned-NAME`. For every NAME in `artifacts` (one matrix leg each, on
    (`verify` step; in `skip` mode it only says the files are unsigned). In both modes it then writes a manifest
    (SHA-256 and relative path of every file under `in/PKG`) of what was verified;
 7. packs `out/PKG.zip` and `out/PKG.zip.sha256` (`pack` step), extracts the zip and compares every path and SHA-256
-   with that manifest, not with the live `in/` folder, so a file changed after `verify` cannot ship (`check` step);
+   with that manifest, not with the live `in/` folder, so a file changed after `verify` cannot ship (`check` step). Both sides of the comparison are sorted the same way,
+   so a naming quirk can only make `check` red, never green;
 8. uploads `out/` as the artifact `NAME` (`retention-days: 7`).
 
 The workflow builds nothing, publishes nothing and reads no secret. The caller owns build, smoke tests and release.
