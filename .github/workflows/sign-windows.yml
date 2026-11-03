@@ -56,7 +56,79 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           $ErrorActionPreference = 'Stop'
-          exit 0
+          $nameRe = '^[A-Za-z0-9._-]+\z'
+          $globRe = '^[A-Za-z0-9._*?\[\]-]+\z'
+          $findings = New-Object System.Collections.Generic.List[string]
+
+          # The parse rule of the three lists, written once per script (copying is cheaper than an unpinned checkout).
+          function Read-JsonList([string]$Name, [string]$Text) {
+            try {
+              $v = ConvertFrom-Json -InputObject $Text -NoEnumerate
+            } catch {
+              $findings.Add("$Name is not a JSON list")
+              return $null
+            }
+            if ($v -isnot [System.Array]) {
+              $findings.Add("$Name is not a JSON list")
+              return $null
+            }
+            return , $v
+          }
+          # The leading comma keeps the set from being unrolled into the pipeline (an empty set would become $null).
+          function New-NameSet { return , [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
+
+          $artifacts = Read-JsonList 'artifacts' $env:ARTIFACTS
+          $ownFiles = Read-JsonList 'own-files' $env:OWN_FILES
+          $extraFiles = Read-JsonList 'extra-files' $env:EXTRA_FILES
+
+          if ($null -ne $artifacts) {
+            if ($artifacts.Count -eq 0) { $findings.Add('artifacts is empty') }
+            $seen = New-NameSet
+            foreach ($a in $artifacts) {
+              if (($a -isnot [string]) -or -not [regex]::IsMatch($a, $nameRe)) {
+                $findings.Add("artifact name '$a' is not ^[A-Za-z0-9._-]+$")
+              } elseif (-not $seen.Add($a)) {
+                $findings.Add("artifacts has a duplicate '$a'")
+              }
+            }
+            if (-not $seen.Contains([string]$env:ARTIFACT)) {
+              $findings.Add("artifact '$($env:ARTIFACT)' is not in artifacts")
+            }
+          }
+
+          if ($null -ne $ownFiles) {
+            if ($ownFiles.Count -eq 0) { $findings.Add('own-files is empty') }
+            $seen = New-NameSet
+            foreach ($o in $ownFiles) {
+              $plain = $o -is [string]
+              if ($plain -and $o.Contains('\')) { $plain = $false }
+              if ($plain) {
+                foreach ($seg in $o.Split('/')) {
+                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..') { $plain = $false }
+                }
+              }
+              if (-not $plain) {
+                $findings.Add("own-files entry '$o' is not a plain relative path (segments of [A-Za-z0-9._-], no . or .., no globs, `"/`" separators)")
+              } elseif (-not $seen.Add($o)) {
+                $findings.Add("own-files has a duplicate '$o'")
+              }
+            }
+          }
+
+          if ($null -ne $extraFiles) {
+            foreach ($g in $extraFiles) {
+              if (($g -isnot [string]) -or -not [regex]::IsMatch($g, $globRe)) {
+                $findings.Add("extra-files entry '$g' is not a file-name glob")
+              }
+            }
+          }
+
+          if ($findings.Count -gt 0) {
+            foreach ($f in $findings) { Write-Host "::error::sign-windows inputs: $f" }
+            Write-Host "::error::sign-windows inputs: $($findings.Count) problem(s)"
+            exit 1
+          }
+          Write-Host "inputs ok: $($artifacts.Count) artifacts, $($ownFiles.Count) own files, $($extraFiles.Count) extra-file globs"
 
       - name: Download the unsigned package
         id: download
@@ -72,7 +144,26 @@ jobs:
           IN_DIR: in
         run: |
           $ErrorActionPreference = 'Stop'
-          exit 0
+          $items = @()
+          if (Test-Path -LiteralPath $env:IN_DIR) {
+            $items = @(Get-ChildItem -LiteralPath $env:IN_DIR -Force)
+          }
+          if (($items.Count -ne 1) -or (-not $items[0].PSIsContainer)) {
+            if ($items.Count -eq 0) {
+              $found = 'nothing'
+            } else {
+              $found = (@($items | Sort-Object Name | ForEach-Object {
+                if ($_.PSIsContainer) { "$($_.Name) (dir)" } else { "$($_.Name) (file)" }
+              })) -join ', '
+            }
+            Write-Host "::error::sign-windows: in/ must hold exactly one directory and nothing else; found: $found"
+            exit 1
+          }
+          $name = $items[0].Name
+          $dir = (Resolve-Path -LiteralPath $items[0].FullName).ProviderPath
+          $out = @("name=$name", "dir=$dir")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, (($out -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "package: $dir"
 
       - name: Decide sign, skip or red
         id: mode
@@ -89,7 +180,48 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
-          exit 0
+          # A variable is set when its value is non-empty. Values are never printed, only names.
+          names=(AZURE_CLIENT_ID AZURE_TENANT_ID SIGNING_ENDPOINT SIGNING_ACCOUNT SIGNING_PROFILE SIGNING_PUBLISHER)
+          set_names=()
+          missing_names=()
+          for n in "${names[@]}"; do
+            if [ -n "${!n:-}" ]; then
+              set_names+=("$n")
+            else
+              missing_names+=("$n")
+            fi
+          done
+          join_names() {
+            local out="" n
+            for n in "$@"; do
+              out="${out:+$out, }$n"
+            done
+            printf '%s' "$out"
+          }
+          forced=no
+          if [ "${REQUIRED:-}" = true ]; then
+            forced=yes
+          fi
+          case "${GITHUB_REF:-}" in
+            refs/tags/*) forced=yes ;;
+          esac
+
+          # The partial row is decided before the forced row: a half configuration is never "none set".
+          if [ "${#set_names[@]}" -gt 0 ] && [ "${#set_names[@]}" -lt 6 ]; then
+            echo "::error::sign-windows: partial signing configuration in environment '${ENVIRONMENT:-}': set $(join_names "${set_names[@]}"); missing $(join_names "${missing_names[@]}")"
+            exit 1
+          fi
+          if [ "${#set_names[@]}" -eq 6 ]; then
+            echo "mode=sign" >> "$GITHUB_OUTPUT"
+            echo "mode: sign (required=${REQUIRED:-}, ref=${GITHUB_REF:-}, environment=${ENVIRONMENT:-})"
+            exit 0
+          fi
+          if [ "$forced" = yes ]; then
+            echo "::error::sign-windows: signing is required (required=${REQUIRED:-}, caller ref ${GITHUB_REF:-}) but none of AZURE_CLIENT_ID, AZURE_TENANT_ID, SIGNING_ENDPOINT, SIGNING_ACCOUNT, SIGNING_PROFILE, SIGNING_PUBLISHER is set in environment '${ENVIRONMENT:-}'"
+            exit 1
+          fi
+          echo "mode=skip" >> "$GITHUB_OUTPUT"
+          echo "::warning::sign-windows: UNSIGNED trial — none of the six signing variables is set in environment '${ENVIRONMENT:-}'; ${ARTIFACT:-} is packed unsigned"
 
       - name: Inventory the binaries
         id: inventory
@@ -101,4 +233,130 @@ jobs:
           EXTRA_FILES: ${{ inputs.extra-files }}
         run: |
           $ErrorActionPreference = 'Stop'
-          exit 0
+          $nameRe = '^[A-Za-z0-9._-]+\z'
+          $globRe = '^[A-Za-z0-9._*?\[\]-]+\z'
+          $findings = New-Object System.Collections.Generic.List[string]
+
+          function Read-JsonList([string]$Name, [string]$Text) {
+            try {
+              $v = ConvertFrom-Json -InputObject $Text -NoEnumerate
+            } catch {
+              $findings.Add("$Name is not a JSON list")
+              return $null
+            }
+            if ($v -isnot [System.Array]) {
+              $findings.Add("$Name is not a JSON list")
+              return $null
+            }
+            return , $v
+          }
+          # The leading comma keeps the set from being unrolled into the pipeline (an empty set would become $null).
+          function New-NameSet { return , [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
+          function Get-Signer($sig) {
+            if ($null -eq $sig.SignerCertificate) { return '-' }
+            return $sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          }
+          # One exit for every red: all findings first, then the count, then exit 1. Nothing goes to GITHUB_OUTPUT.
+          function Stop-Red {
+            foreach ($f in $findings) { Write-Host "::error::sign-windows inventory: $f" }
+            Write-Host "::error::sign-windows inventory: $($findings.Count) problem(s) in $($env:PKG_NAME)"
+            exit 1
+          }
+
+          # 1. The two lists, with the rules of the inputs step. An empty own-files is red here too.
+          $ownFiles = Read-JsonList 'own-files' $env:OWN_FILES
+          $extraFiles = Read-JsonList 'extra-files' $env:EXTRA_FILES
+          if ($null -ne $ownFiles) {
+            if ($ownFiles.Count -eq 0) { $findings.Add('own-files is empty') }
+            $seen = New-NameSet
+            foreach ($o in $ownFiles) {
+              $plain = $o -is [string]
+              if ($plain -and $o.Contains('\')) { $plain = $false }
+              if ($plain) {
+                foreach ($seg in $o.Split('/')) {
+                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..') { $plain = $false }
+                }
+              }
+              if (-not $plain) {
+                $findings.Add("own-files entry '$o' is not a plain relative path (segments of [A-Za-z0-9._-], no . or .., no globs, `"/`" separators)")
+              } elseif (-not $seen.Add($o)) {
+                $findings.Add("own-files has a duplicate '$o'")
+              }
+            }
+          }
+          if ($null -ne $extraFiles) {
+            foreach ($g in $extraFiles) {
+              if (($g -isnot [string]) -or -not [regex]::IsMatch($g, $globRe)) {
+                $findings.Add("extra-files entry '$g' is not a file-name glob")
+              }
+            }
+          }
+          if ($findings.Count -gt 0) { Stop-Red }
+
+          # 2. Every PE below the package directory (case-insensitive extension).
+          $root = (Resolve-Path -LiteralPath $env:PKG_DIR).ProviderPath.TrimEnd('\')
+          $peFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object { $_.Extension -in '.exe', '.dll' })
+          $byRel = @{}
+          foreach ($f in $peFiles) {
+            $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+            $byRel[$rel] = $f.FullName
+          }
+
+          $toSign = New-Object System.Collections.Generic.List[string]
+          $kept = New-Object System.Collections.Generic.List[string]
+          $ownRels = New-NameSet
+
+          # 3. Own files, in list order: each must exist and be NotSigned.
+          foreach ($own in $ownFiles) {
+            [void]$ownRels.Add($own)
+            $p = Join-Path $root ($own -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+              $findings.Add("own file '$own' not found under $($env:PKG_NAME)")
+              continue
+            }
+            $sig = Get-AuthenticodeSignature -LiteralPath $p
+            if ([string]$sig.Status -eq 'NotSigned') {
+              $toSign.Add($p)
+            } else {
+              $findings.Add("own file '$own' is $($sig.Status), signer '$(Get-Signer $sig)' — a vendor file named as the product's binary?")
+            }
+          }
+
+          # 4. Every other PE, in ordinal order of its package-relative path.
+          $rels = [string[]]@($byRel.Keys)
+          [System.Array]::Sort($rels, [System.StringComparer]::Ordinal)
+          foreach ($rel in $rels) {
+            if ($ownRels.Contains($rel)) { continue }
+            $p = $byRel[$rel]
+            $sig = Get-AuthenticodeSignature -LiteralPath $p
+            $status = [string]$sig.Status
+            if ($status -eq 'Valid') {
+              $kept.Add($p)
+              Write-Host "kept vendor file ${rel}: Valid, signer '$(Get-Signer $sig)', $($sig.SignatureType)"
+            } elseif ($status -eq 'NotSigned') {
+              $leaf = [System.IO.Path]::GetFileName($p)
+              $matched = $null
+              foreach ($g in $extraFiles) {
+                $hit = $false
+                try { $hit = $leaf -like $g } catch { $hit = $false }
+                if ($hit) { $matched = $g; break }
+              }
+              if ($null -ne $matched) {
+                $toSign.Add($p)
+                Write-Host "extra file ${rel}: NotSigned, matched '$matched'"
+              } else {
+                $findings.Add("unsigned file '$rel' is neither an own file nor matched by extra-files $($env:EXTRA_FILES)")
+              }
+            } else {
+              $findings.Add("file '$rel' has signature status $status")
+            }
+          }
+
+          # 5. Any finding: all of them, then one exit.
+          if ($findings.Count -gt 0) { Stop-Red }
+
+          # 6. Outputs: the paths to sign (own files first), the kept vendor files, and their counts.
+          $delim = '__SIGN_WINDOWS_EOF__'
+          $lines = @("files<<$delim") + $toSign.ToArray() + @($delim, "count=$($toSign.Count)", "kept-files<<$delim") + $kept.ToArray() + @($delim, "kept-count=$($kept.Count)")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "to sign: $($toSign.Count), kept: $($kept.Count)"
