@@ -424,6 +424,8 @@ jobs:
           SIGNING_PUBLISHER: ${{ vars.SIGNING_PUBLISHER }}
           FILES: ${{ steps.inventory.outputs.files }}
           KEPT_FILES: ${{ steps.inventory.outputs.kept-files }}
+          PKG_DIR: ${{ steps.pkg.outputs.dir }}
+          VERIFIED_MANIFEST: ${{ runner.temp }}/sign-windows-verified.sha256
         run: |
           $ErrorActionPreference = 'Stop'
           $findings = New-Object System.Collections.Generic.List[string]
@@ -436,8 +438,25 @@ jobs:
             return @($Text -split "`r?`n" | Where-Object { $_ -ne '' })
           }
 
+          # What was verified: a manifest (sha256, two spaces, a relative path with '/') of every file under the package
+          # directory. The check step compares the zip with this file, not with the live in/ folder.
+          function Write-Manifest {
+            $root = (Resolve-Path -LiteralPath $env:PKG_DIR).ProviderPath.TrimEnd('\')
+            $map = @{}
+            foreach ($f in Get-ChildItem -LiteralPath $root -Recurse -File -Force) {
+              $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+              $map[$rel] = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+            }
+            $rels = [string[]]@($map.Keys)
+            [System.Array]::Sort($rels, [System.StringComparer]::Ordinal)
+            $lines = @(foreach ($r in $rels) { "$($map[$r])  $r" })
+            [System.IO.File]::WriteAllText($env:VERIFIED_MANIFEST, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "verified manifest: $($rels.Count) files"
+          }
+
           if ($env:MODE -eq 'skip') {
             Write-Host 'verify: mode is skip, so the files are unsigned and there is nothing to verify'
+            Write-Manifest
             exit 0
           }
           if ($env:MODE -ne 'sign') {
@@ -486,6 +505,7 @@ jobs:
             exit 1
           }
           Write-Host "verify ok: $($files.Count) signed, $($kept.Count) kept"
+          Write-Manifest
 
       - name: Pack the zip and its checksum
         id: pack
@@ -503,6 +523,7 @@ jobs:
         shell: bash
         env:
           PKG: ${{ steps.pkg.outputs.name }}
+          VERIFIED_MANIFEST: ${{ runner.temp }}/sign-windows-verified.sha256
         run: |
           set -euo pipefail
           list_dir() {
@@ -519,7 +540,8 @@ jobs:
             echo "::error::sign-windows check: out/ must hold exactly $PKG.zip and $PKG.zip.sha256; found: $listing"
             exit 1
           fi
-          # Extract the zip and compare the set of paths and every file's SHA-256 with in/$PKG.
+          # Extract the zip and compare the set of paths and every file's SHA-256 with what verify VERIFIED (its manifest),
+          # not with the live in/ folder: a file changed after verify must not ship.
           rm -rf check
           mkdir check
           7z x "out/$PKG.zip" -ocheck -y > /dev/null
@@ -530,19 +552,24 @@ jobs:
           fi
           tmp=$(mktemp -d)
           manifest() {
-            (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+            (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) | sed -E 's/^([0-9a-f]{64}) [ *]\.\//\1  /' | LC_ALL=C sort
           }
-          manifest "in/$PKG" > "$tmp/in.txt"
+          verified=$(cygpath -u "$VERIFIED_MANIFEST")
+          if [ ! -f "$verified" ]; then
+            echo "::error::sign-windows check: the verify step left no manifest at $VERIFIED_MANIFEST"
+            exit 1
+          fi
+          LC_ALL=C sort "$verified" > "$tmp/in.txt"
           manifest "check/$PKG" > "$tmp/zip.txt"
           if ! diff -q "$tmp/in.txt" "$tmp/zip.txt" > /dev/null; then
-            { diff "$tmp/in.txt" "$tmp/zip.txt" || true; } | { grep -E '^[<>] ' || true; } | sed -E 's/^[<>] [0-9a-f]{64} [ *]//' | LC_ALL=C sort -u | while IFS= read -r name; do
-              echo "::error::sign-windows check: '$name' differs between in/$PKG and the zip (missing, extra, or another hash)"
+            { diff "$tmp/in.txt" "$tmp/zip.txt" || true; } | { grep -E '^[<>] ' || true; } | sed -E 's/^[<>] [0-9a-f]{64}  //' | LC_ALL=C sort -u | while IFS= read -r name; do
+              echo "::error::sign-windows check: '$name' differs between the verified files and the zip (missing, extra, or another hash)"
             done
-            echo "::error::sign-windows check: the zip does not hold the bytes of in/$PKG"
+            echo "::error::sign-windows check: the zip does not hold the verified bytes"
             exit 1
           fi
           (cd out && sha256sum -c "$PKG.zip.sha256")
-          echo "check ok: $(wc -l < "$tmp/in.txt") files in $PKG.zip equal in/$PKG"
+          echo "check ok: $(wc -l < "$tmp/in.txt") files in $PKG.zip equal the verified files"
 
       - name: Upload the signed package
         id: upload
