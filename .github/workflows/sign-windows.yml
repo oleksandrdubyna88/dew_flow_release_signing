@@ -109,8 +109,9 @@ jobs:
               $plain = $o -is [string]
               if ($plain -and $o.Contains('\')) { $plain = $false }
               if ($plain) {
+                # A segment that ends in a dot is refused: Win32 strips the dot, so 'app.exe.' would name 'app.exe' again.
                 foreach ($seg in $o.Split('/')) {
-                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..') { $plain = $false }
+                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..' -or $seg.EndsWith('.')) { $plain = $false }
                 }
               }
               if (-not $plain) {
@@ -284,8 +285,9 @@ jobs:
               $plain = $o -is [string]
               if ($plain -and $o.Contains('\')) { $plain = $false }
               if ($plain) {
+                # A segment that ends in a dot is refused: Win32 strips the dot, so 'app.exe.' would name 'app.exe' again.
                 foreach ($seg in $o.Split('/')) {
-                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..') { $plain = $false }
+                  if (-not [regex]::IsMatch($seg, $nameRe) -or $seg -eq '.' -or $seg -eq '..' -or $seg.EndsWith('.')) { $plain = $false }
                 }
               }
               if (-not $plain) {
