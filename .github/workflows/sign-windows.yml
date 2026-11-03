@@ -376,6 +376,9 @@ jobs:
             }
           }
 
+          # The signing list and the kept list travel through environment variables (Windows allows 32 KB in all).
+          if ($toSign.Count -gt 200) { $findings.Add('more than 200 files to sign — split the package') }
+
           # 5. Any finding: all of them, then one exit.
           if ($findings.Count -gt 0) { Stop-Red }
 
