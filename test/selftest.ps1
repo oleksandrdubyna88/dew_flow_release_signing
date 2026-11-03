@@ -328,6 +328,8 @@ $cases = @(
   # E: more than 200 files to sign is one finding (the list travels through an environment variable).
   @{ Id = 'E.201'; Step = 'inventory'; Tree = (With-Tree -Add $manyExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 1; Expect = @('more than 200 files to sign'); NoOutput = $true }
   @{ Id = 'E.200'; Step = 'inventory'; Tree = (With-Tree -Add $fewExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 0; Outputs = @{ count = '200' } }
+  # F: the one-directory error says how to cure it when the package folder itself was uploaded.
+  @{ Id = 'F.cure'; Step = 'pkg'; Tree = [ordered]@{ 'in/app.exe' = 'app.exe'; 'in/vendor.exe' = 'vendor.exe' }; Exit = 1; Expect = @('exactly one directory', 'upload its PARENT'); NoOutput = $true }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
