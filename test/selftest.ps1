@@ -33,7 +33,7 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 # Child processes. The exit code is read from the process object itself, so nothing can overwrite it.
 # ---------------------------------------------------------------------------------------------------------------
 $cleanEnvRe = '^(GITHUB_|ACTIONS_|AZURE_|SIGNING_|INPUT_)'
-$cleanEnvNames = @('REQUIRED', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR', 'PKG', 'MODE', 'FILES', 'KEPT_FILES')
+$cleanEnvNames = @('REQUIRED', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR', 'PKG', 'MODE', 'FILES', 'KEPT_FILES', 'VERIFIED_MANIFEST')
 
 function Invoke-Child {
   param([string]$File, [string[]]$Arguments, [string]$WorkDir, [hashtable]$ChildEnv = @{})
@@ -181,6 +181,7 @@ function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
     REQUIRED = 'false'
     GITHUB_REF = 'refs/heads/main'
     ENVIRONMENT = 'release-signing'
+    VERIFIED_MANIFEST = (Join-Path $caseDir 'verified.sha256')
   }
   foreach ($v in $sixVars) { $base[$v] = '' }
   $flow = @{}
@@ -294,18 +295,50 @@ $cases = @(
      ) }
   @{ Id = 'E1.A2'; Step = 'mode'; Env = $fifthMissing; Exit = 1; Expect = @('partial signing configuration', 'missing SIGNING_PUBLISHER'); NoOutput = $true }
   @{ Id = 'E1.A3'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/sub/app.exe' = 'app.exe' }); Exit = 1; Expect = @("unsigned file 'sub/app.exe' is neither an own file"); NoOutput = $true }
-  # E1.A4: pack ran, then one file under in/pkg changes: check is red and names the file.
+  # E1.A4: the zip is compared with what was VERIFIED. Here the zip gets an extra file after pack: check is red and names it.
   @{ Id = 'E1.A4'
      Steps = @(
        @{ Step = 'pkg' },
+       @{ Step = 'verify'; Env = @{ MODE = 'skip' } },
        @{ Step = 'pack' },
-       @{ Step = 'check'; Exit = 1; Expect = @('app.exe'); NoOutput = $true
+       @{ Step = 'check'; Exit = 1; Expect = @('injected.txt'); NoOutput = $true
+          Prepare = {
+            param($caseDir, $pkgDir)
+            $inj = Join-Path $caseDir 'inj\pkg'
+            $null = New-Item -ItemType Directory -Path $inj -Force
+            [System.IO.File]::WriteAllText((Join-Path $inj 'injected.txt'), 'tampered')
+            Push-Location (Join-Path $caseDir 'inj')
+            try { & 7z u (Join-Path $caseDir 'out\pkg.zip') 'pkg\injected.txt' | Out-Null; if ($LASTEXITCODE -ne 0) { throw "7z u exited $LASTEXITCODE" } } finally { Pop-Location }
+          } }
+     ) }
+  # B (TOCTOU): a file under in/pkg changes AFTER verify and BEFORE pack. The zip holds the changed bytes, so it differs from
+  # what was verified: check must be red and name the file.
+  @{ Id = 'B.toctou'
+     Steps = @(
+       @{ Step = 'pkg' },
+       @{ Step = 'verify'; Env = @{ MODE = 'skip' } },
+       @{ Step = 'pack'
           Prepare = {
             param($caseDir, $pkgDir)
             $fs = [System.IO.File]::Open((Join-Path $pkgDir 'app.exe'), [System.IO.FileMode]::Append)
             try { $fs.WriteByte(0) } finally { $fs.Dispose() }
-          } }
+          } },
+       @{ Step = 'check'; Exit = 1; Expect = @('app.exe'); NoOutput = $true }
      ) }
+  # B: verify writes the manifest of every file under in/pkg (both modes): sha256, two spaces, a relative path with '/'.
+  @{ Id = 'B.manifest'; Step = 'verify'; Env = @{ MODE = 'skip' }; Exit = 0
+     Final = {
+       param($caseDir)
+       $f = Join-Path $caseDir 'verified.sha256'
+       if (-not (Test-Path -LiteralPath $f)) { return 'verify wrote no manifest' }
+       $lines = @([System.IO.File]::ReadAllText($f) -split "`r?`n" | Where-Object { $_ -ne '' })
+       foreach ($name in 'app.exe', 'vendor.exe') {
+         $h = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $caseDir "in\pkg\$name")).Hash.ToLowerInvariant()
+         if ($lines -cnotcontains "$h  $name") { return "manifest lacks '$h  $name': $($lines -join ' | ')" }
+       }
+       if ($lines.Count -ne 2) { return "manifest has $($lines.Count) lines, expected 2" }
+       return $null
+     } }
   # The verify step, without Azure: the signer and the status are read from files that are signed already.
   @{ Id = 'V-pos'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = '{SIGNER}' }; Exit = 0; Expect = @('verified ', 'timestamped') }
   @{ Id = 'V-pub'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = 'Wrong Org' }; Exit = 1; Expect = @('vendor.exe', "signed by '{SIGNER}'", "expected publisher 'Wrong Org'") }
