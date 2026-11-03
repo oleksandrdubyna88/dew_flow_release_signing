@@ -195,7 +195,14 @@ function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
       if ($src) { foreach ($k in $src.Keys) { $stepEnv[$k] = Expand-Text ([string]$src[$k]) $pkgDir } }
     }
 
-    $r = Invoke-WorkflowStep -WorkflowFile $WorkflowFile -StepId $spec.Step -CaseDir $caseDir -StepEnv $stepEnv -ScratchDir $scratch
+    # Hold: a file of the tree is held open with FileShare.None while the step runs, so it cannot be read.
+    $held = $null
+    if ($spec.Hold) { $held = [System.IO.File]::Open((Join-Path $caseDir $spec.Hold), [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+    try {
+      $r = Invoke-WorkflowStep -WorkflowFile $WorkflowFile -StepId $spec.Step -CaseDir $caseDir -StepEnv $stepEnv -ScratchDir $scratch
+    } finally {
+      if ($held) { $held.Dispose() }
+    }
     if ($r.RunStepFailed) { return "run-step.mjs exited $($r.ExitCode) for step '$($spec.Step)': $($r.Output.Trim())" }
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -363,6 +370,9 @@ $cases = @(
   @{ Id = 'E.200'; Step = 'inventory'; Tree = (With-Tree -Add $fewExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 0; Outputs = @{ count = '200' } }
   # F: the one-directory error says how to cure it when the package folder itself was uploaded.
   @{ Id = 'F.cure'; Step = 'pkg'; Tree = [ordered]@{ 'in/app.exe' = 'app.exe'; 'in/vendor.exe' = 'vendor.exe' }; Exit = 1; Expect = @('exactly one directory', 'upload its PARENT'); NoOutput = $true }
+  # A, read errors: a file that cannot be read is a finding (fail-closed), never an unhandled exception; a 0-byte file is ignored.
+  @{ Id = 'A.unreadable'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/held.bin' = 'app.exe' }); Hold = 'in\pkg\held.bin'; Exit = 1; Expect = @("file 'held.bin' cannot be read"); NoOutput = $true }
+  @{ Id = 'A.empty'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/empty.bin' = 'text:' }); Exit = 0; Outputs = @{ count = '1'; 'kept-count' = '1' } }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
