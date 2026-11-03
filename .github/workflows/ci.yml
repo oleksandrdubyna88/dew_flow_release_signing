@@ -1,0 +1,184 @@
+name: ci
+
+# Pins: every action by 40-hex commit SHA with its version in the comment. Only checkout, upload-artifact and
+# download-artifact.
+# No setup-node: the runner's own node runs the harness.
+
+# push: every branch, never a tag. A tag ref makes sign-windows treat signing as required, and the trial call has no
+# signing variables on purpose.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint every workflow
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          # Without shellcheck on PATH actionlint keeps its own rules and silently drops the shell analysis
+          # of every run: block: no warning, exit zero, a green check. So assert it first.
+          command -v shellcheck > /dev/null || {
+            echo "shellcheck is not on PATH: actionlint would skip every run: block and pass"
+            exit 1
+          }
+          # The binary is pinned by version and verified by checksum: what runs is what was reviewed.
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 5 --retry-max-time 120 --retry-all-errors \
+            -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+  harness:
+    name: harness · sign-windows steps
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the YAML parser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --version
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "npm ci exited $LASTEXITCODE" }
+
+      - name: Run the self-test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./test/selftest.ps1
+
+  # The one real call of sign-windows.yml (case 1): the package has an own file and a vendor file, and the called
+  # environment never holds variables, so the call takes the unsigned trial road.
+  trial-input:
+    name: trial · build the unsigned package
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the package folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fix = Join-Path $env:RUNNER_TEMP 'fixtures'
+          $work = Join-Path $env:RUNNER_TEMP 'fixture-build'
+          $null = New-Item -ItemType Directory -Path $fix, $work
+          ./test/fixtures/make-fixtures.ps1 -OutDir $fix -WorkDir $work
+          # The upload is the PARENT of the package folder, so the folder itself is kept in the artifact.
+          $pkg = 'unsigned/selftest-0.0.0-win-x64'
+          $null = New-Item -ItemType Directory -Path $pkg
+          Copy-Item -LiteralPath (Join-Path $fix 'app.exe') -Destination (Join-Path $pkg 'selftest.exe')
+          Copy-Item -LiteralPath (Join-Path $fix 'vendor.exe') -Destination (Join-Path $pkg 'dotnet.exe')
+          Get-ChildItem -Recurse -File $pkg | ForEach-Object { Write-Host "$($_.FullName) $((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)" }
+
+      - name: Upload the unsigned package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-selftest-win-x64
+          path: unsigned/
+          if-no-files-found: error
+          retention-days: 7
+
+  trial-call:
+    name: trial · call sign-windows
+    needs: trial-input
+    # A caller must grant what the called job asks for.
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/sign-windows.yml
+    with:
+      artifacts: '["selftest-win-x64"]'
+      own-files: '["selftest.exe"]'
+      required: false
+      environment: selftest-no-signing
+
+  trial-check:
+    name: trial · check the result
+    needs: trial-call
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the input and the result
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-selftest-win-x64
+          path: unsigned
+
+      - name: Download the result of the trial call
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: selftest-win-x64
+          path: out
+
+      - name: Assert case 1
+        shell: bash
+        env:
+          PKG: selftest-0.0.0-win-x64
+        run: |
+          set -euo pipefail
+          list_dir() {
+            local e names=()
+            for e in "$1"/* "$1"/.[!.]*; do
+              [ -e "$e" ] || continue
+              names+=("${e##*/}")
+            done
+            printf '%s\n' "${names[@]:-}" | LC_ALL=C sort | tr '\n' ' '
+          }
+          fail() {
+            echo "::error::trial-check: $1"
+            exit 1
+          }
+          # 1. The artifact holds exactly the zip and its checksum.
+          listing=$(list_dir out)
+          [ "$listing" = "$PKG.zip $PKG.zip.sha256 " ] || fail "out holds '$listing', expected $PKG.zip and $PKG.zip.sha256"
+          # 2. Every entry of the zip is under PKG/: the only top-level entry is PKG/. (7z on Windows prints backslashes.)
+          entries=$(7z l -ba -slt "out/$PKG.zip" | sed -n 's/^Path = //p' | tr -d '\r' | tr '\134' '/')
+          [ -n "$entries" ] || fail "the zip lists no entries"
+          while IFS= read -r entry; do
+            case "$entry" in
+              "$PKG" | "$PKG"/*) ;;
+              *) fail "zip entry '$entry' is not under $PKG/" ;;
+            esac
+          done <<< "$entries"
+          # 3. The extracted files equal the input files: same paths, same SHA-256.
+          rm -rf x
+          mkdir x
+          7z x "out/$PKG.zip" -ox -y > /dev/null
+          [ "$(list_dir x)" = "$PKG " ] || fail "the zip does not extract to a single $PKG/ folder"
+          manifest() {
+            (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+          }
+          manifest "unsigned/$PKG" > in.txt
+          manifest "x/$PKG" > zip.txt
+          [ -s in.txt ] || fail "the input package holds no files"
+          diff in.txt zip.txt || fail "the extracted files differ from the input files"
+          # 4. The checksum file passes.
+          (cd out && sha256sum -c "$PKG.zip.sha256")
+          echo "case 1 ok: $(wc -l < in.txt) files, layout $PKG/, checksum passes"
