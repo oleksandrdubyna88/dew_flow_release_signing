@@ -324,11 +324,21 @@ jobs:
             }
           }
           $root = (Resolve-Path -LiteralPath $env:PKG_DIR).ProviderPath.TrimEnd('\')
-          $peFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object { ($_.Extension -in '.exe', '.dll') -or (Test-Mz $_.FullName) })
           $byRel = @{}
-          foreach ($f in $peFiles) {
+          foreach ($f in Get-ChildItem -LiteralPath $root -Recurse -File -Force) {
             $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
-            $byRel[$rel] = $f.FullName
+            $isPe = $f.Extension -in '.exe', '.dll'
+            # A file shorter than 2 bytes cannot start with MZ and is not opened. A file that cannot be read is a finding
+            # (fail-closed), never an unhandled exception.
+            if ((-not $isPe) -and ($f.Length -ge 2)) {
+              try {
+                $isPe = Test-Mz $f.FullName
+              } catch {
+                $findings.Add("file '$rel' cannot be read: $($_.Exception.Message)")
+                continue
+              }
+            }
+            if ($isPe) { $byRel[$rel] = $f.FullName }
           }
 
           $toSign = New-Object System.Collections.Generic.List[string]
