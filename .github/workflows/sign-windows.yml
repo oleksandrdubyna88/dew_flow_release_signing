@@ -1,0 +1,104 @@
+name: sign windows
+
+# Reusable workflow: Windows Authenticode signing with Azure Artifact Signing.
+# Contract: dew_flow_creds_for_devs, todo/PLAN_windows_code_signing_E1_S1_spec.md.
+# Rule for every step of this file: no ${{ }} inside run:. Every value reaches a script through env:.
+
+on:
+  workflow_call:
+    inputs:
+      artifacts:
+        description: 'JSON list of output artifact names, e.g. ["cli-win-x64","cli-win-arm64"]. For each NAME the caller uploaded unsigned-NAME holding exactly one top-level directory. Non-empty; each name matches ^[A-Za-z0-9._-]+$.'
+        type: string
+        required: true
+      own-files:
+        description: 'JSON list of package-relative paths of the caller''s OWN binaries, e.g. ["creds.exe"]. Non-empty; "/" separators; no globs; no "." or ".." segments. Each must exist once and arrive unsigned.'
+        type: string
+        required: true
+      extra-files:
+        description: 'JSON list of file-NAME globs (PowerShell -like: * ? []) of other files that may be signed when they arrive unsigned, e.g. ["e_sqlite3.dll","*tree-sitter*.dll"]. No path separators. An unsigned PE that is neither an own file nor matched here is red.'
+        type: string
+        required: false
+        default: '[]'
+      required:
+        description: 'true: missing configuration or any failure is red. Independently, a caller ref under refs/tags/ is treated as required.'
+        type: boolean
+        required: true
+      environment:
+        description: 'The caller''s environment that holds AZURE_CLIENT_ID, AZURE_TENANT_ID, SIGNING_ENDPOINT, SIGNING_ACCOUNT, SIGNING_PROFILE, SIGNING_PUBLISHER and the OIDC trust.'
+        type: string
+        required: false
+        default: release-signing
+
+permissions: {}
+
+jobs:
+  sign:
+    name: sign ${{ matrix.artifact }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: ${{ fromJSON(inputs.artifacts) }}
+    steps:
+      - name: Check the inputs
+        id: inputs
+        shell: pwsh
+        env:
+          ARTIFACTS: ${{ inputs.artifacts }}
+          OWN_FILES: ${{ inputs.own-files }}
+          EXTRA_FILES: ${{ inputs.extra-files }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          exit 0
+
+      - name: Download the unsigned package
+        id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-${{ matrix.artifact }}
+          path: in
+
+      - name: Find the package directory
+        id: pkg
+        shell: pwsh
+        env:
+          IN_DIR: in
+        run: |
+          $ErrorActionPreference = 'Stop'
+          exit 0
+
+      - name: Decide sign, skip or red
+        id: mode
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SIGNING_ENDPOINT: ${{ vars.SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.SIGNING_PROFILE }}
+          SIGNING_PUBLISHER: ${{ vars.SIGNING_PUBLISHER }}
+          REQUIRED: ${{ inputs.required }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          exit 0
+
+      - name: Inventory the binaries
+        id: inventory
+        shell: pwsh
+        env:
+          PKG_DIR: ${{ steps.pkg.outputs.dir }}
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
+          OWN_FILES: ${{ inputs.own-files }}
+          EXTRA_FILES: ${{ inputs.extra-files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          exit 0

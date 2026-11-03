@@ -1,0 +1,64 @@
+name: ci
+
+# Pins: every action by 40-hex commit SHA with its version in the comment. No other action than checkout.
+# No setup-node: the runner's own node runs the harness.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint every workflow
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          # Without shellcheck on PATH actionlint keeps its own rules and silently drops the shell analysis
+          # of every run: block: no warning, exit zero, a green check. So assert it first.
+          command -v shellcheck > /dev/null || {
+            echo "shellcheck is not on PATH: actionlint would skip every run: block and pass"
+            exit 1
+          }
+          # The binary is pinned by version and verified by checksum: what runs is what was reviewed.
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 5 --retry-max-time 120 --retry-all-errors \
+            -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+  harness:
+    name: harness · sign-windows steps
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the YAML parser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --version
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "npm ci exited $LASTEXITCODE" }
+
+      - name: Run the self-test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./test/selftest.ps1
