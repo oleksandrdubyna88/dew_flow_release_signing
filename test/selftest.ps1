@@ -308,6 +308,14 @@ $cases = @(
   @{ Id = 'V-kept'; Step = 'verify'; Tree = (With-Tree -Add @{ 'in/pkg/vendor-flipped.exe' = 'vendor-flipped.exe' })
      Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = '{PKG}\vendor-flipped.exe'; SIGNING_PUBLISHER = '{SIGNER}' }; Exit = 1; Expect = @('vendor-flipped.exe', 'HashMismatch') }
   @{ Id = 'V-skip'; Step = 'verify'; Env = @{ MODE = 'skip'; FILES = '{PKG}\app.exe'; KEPT_FILES = '' }; Exit = 0; Expect = @('unsigned') }
+  # A: a PE is found by its first two bytes (MZ), whatever its name. Unsigned and undeclared is red; declared is signed; Valid is kept.
+  @{ Id = 'A.bin'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/helper.bin' = 'app.exe' }); Exit = 1; Expect = @("unsigned file 'helper.bin' is neither an own file"); NoOutput = $true }
+  @{ Id = 'A.noext'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/noext' = 'app.exe' }); Exit = 1; Expect = @("unsigned file 'noext' is neither an own file"); NoOutput = $true }
+  @{ Id = 'A.extra'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/helper.bin' = 'app.exe' }); Env = @{ EXTRA_FILES = '["helper.bin"]' }; Exit = 0
+     Expect = @("extra file helper.bin: NotSigned, matched 'helper.bin'"); Outputs = @{ count = '2'; 'kept-count' = '1' } }
+  @{ Id = 'A.kept'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/vendor.dat' = 'vendor.exe' }); Exit = 0
+     Expect = @('kept vendor file vendor.dat: Valid'); Outputs = @{ count = '1'; 'kept-count' = '2' } }
+  @{ Id = 'A.text'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/notes.txt' = 'text:hello' }); Exit = 0; Outputs = @{ count = '1'; 'kept-count' = '1' } }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
