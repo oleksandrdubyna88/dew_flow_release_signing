@@ -270,6 +270,8 @@ $cases = @(
   @{ Id = 'S1.A1'; Step = 'inputs'; Env = @{ OWN_FILES = '["creds.exe"' }; Exit = 1; Expect = @('own-files is not a JSON list') }
   @{ Id = 'S1.A2'; Step = 'inputs'; Env = @{ ARTIFACTS = '["cli win"]'; OWN_FILES = '["../x.exe"]' }; Exit = 1; Expect = @("artifact name 'cli win'", "own-files entry '../x.exe'") }
   @{ Id = 'S1.A3'; Step = 'inputs'; Env = @{ OWN_FILES = '[]' }; Exit = 1; Expect = @('own-files is empty') }
+  # Win32 strips a trailing dot, so 'app.exe.' names the same file as 'app.exe': refused, not left to the duplicate check.
+  @{ Id = 'S1.A9'; Step = 'inputs'; Env = @{ OWN_FILES = '["app.exe","app.exe."]' }; Exit = 1; Expect = @("own-files entry 'app.exe.'") }
   @{ Id = 'S1.A4'; Step = 'pkg'; Exit = 1; Expect = @('exactly one directory', 'found: '); NoOutput = $true
      Trees = @(
        [ordered]@{ 'in/pkg' = '<dir>'; 'in/other' = '<dir>' },
