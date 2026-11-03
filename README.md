@@ -11,12 +11,15 @@ artifact `unsigned-NAME`. For every NAME in `artifacts` (one matrix leg each, on
 2. downloads `unsigned-NAME` into `in/` and checks that `in/` holds exactly one directory, the package folder (`pkg` step);
 3. decides `sign`, `skip` or red from the six signing variables of the caller's environment (`mode` step);
 4. lists the binaries: the caller's own files must arrive unsigned, other unsigned files must be declared in
-   `extra-files`, vendor-signed files must still be `Valid` (`inventory` step, before any login, in every mode);
+   `extra-files`, vendor-signed files must still be `Valid` (`inventory` step, before any login, in every mode).
+   A PE is found by its content: every file whose first two bytes are `MZ` counts, whatever its name (`helper.bin`,
+   a file without extension), as well as every `.exe` and `.dll`;
 5. in `sign` mode: logs in to Azure with OIDC and signs the listed files with `azure/artifact-signing-action`;
 6. verifies the signatures: `Valid`, timestamped, signer equal to `SIGNING_PUBLISHER`, kept vendor files still `Valid`
-   (`verify` step; in `skip` mode it only says the files are unsigned);
+   (`verify` step; in `skip` mode it only says the files are unsigned). In both modes it then writes a manifest
+   (SHA-256 and relative path of every file under `in/PKG`) of what was verified;
 7. packs `out/PKG.zip` and `out/PKG.zip.sha256` (`pack` step), extracts the zip and compares every path and SHA-256
-   with `in/PKG` (`check` step);
+   with that manifest, not with the live `in/` folder, so a file changed after `verify` cannot ship (`check` step);
 8. uploads `out/` as the artifact `NAME` (`retention-days: 7`).
 
 The workflow builds nothing, publishes nothing and reads no secret. The caller owns build, smoke tests and release.
@@ -47,6 +50,20 @@ The six variables of the caller's `environment` (none is a secret): `AZURE_CLIEN
 A job that names an environment the caller's repository does not have makes GitHub create it, empty. A typo in
 `environment` is therefore not an error: a trial takes `skip`, a tag is red. Every message names the environment.
 
+## Limits and rules for the package
+
+- The package folder name must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`: no leading dash (7z would read it as a switch)
+  and no comma (the signing action splits its list of files on it). Anything else is red in the `pkg` step.
+- At most 200 files to sign (own files plus matched extra files) in one package. The list reaches the later steps
+  through environment variables, which Windows limits to 32 KB. More is one finding: "more than 200 files to sign —
+  split the package".
+- An own-files path has no segment that ends in a dot (Win32 strips the dot, so `app.exe.` would name `app.exe` again).
+- `artifacts` empty or not a JSON list: GitHub fails the calling job when it evaluates the matrix, before any step runs
+  (measured on 2026-11-03 with three probe calls: `[]`, a JSON string and malformed JSON; each ended `failure`, and no
+  leg started). The `inputs` step repeats the check, so the self-test proves the rule and the message.
+- If `in/` holds files instead of one folder, the package folder itself was uploaded. Upload its PARENT so the folder
+  survives: `actions/upload-artifact` keeps the contents of a directory path, not the directory.
+
 ## The artifact contract
 
 - In: for each NAME in `artifacts`, an artifact `unsigned-NAME` holding exactly one top-level directory PKG
@@ -71,6 +88,15 @@ A job that names an environment the caller's repository does not have makes GitH
   so only the `azure/login` session can authenticate.
 - Every action is pinned by its 40-hex commit SHA. The workflow checks out nothing.
 - `verify` compares the signer simple name with `SIGNING_PUBLISHER` exactly (ordinal, case-sensitive).
+
+## Trust boundary
+
+- The signer signs what the caller's build produced. The workflow has no provenance check of its own: whoever can run
+  the caller's `release-signing` environment (a branch or tag its deployment rule admits) can have a binary signed with
+  the organization's certificate. Keep that rule narrow.
+- The signing action installs its tools (PSGallery and NuGet modules, version-pinned but not hash-pinned) at run
+  time, inside the job that holds the Azure session. The owner should enable diagnostic logs on the Artifact Signing
+  account and watch the sign operations.
 
 ## Caller snippet
 
@@ -125,7 +151,8 @@ pwsh -File test/selftest.ps1
 ```
 
 The fixtures are made at run time in a folder whose path has a space, and removed at the end. Nothing binary is
-committed. The `sign` road needs Azure and is proven by the first real release of a caller.
+committed. The `sign` road needs Azure. V1 proves it: a dry run on the caller's PR branch before its merge
+(`dew_flow_creds_for_devs · todo/PLAN_windows_code_signing.md` section 5).
 
 ## License
 
