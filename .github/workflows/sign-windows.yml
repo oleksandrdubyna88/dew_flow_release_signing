@@ -405,7 +405,66 @@ jobs:
           KEPT_FILES: ${{ steps.inventory.outputs.kept-files }}
         run: |
           $ErrorActionPreference = 'Stop'
-          exit 0
+          $findings = New-Object System.Collections.Generic.List[string]
+          # The same reading of the signer that the inventory step uses.
+          function Get-Signer($sig) {
+            if ($null -eq $sig.SignerCertificate) { return '-' }
+            return $sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          }
+          function Split-Lines([string]$Text) {
+            return @($Text -split "`r?`n" | Where-Object { $_ -ne '' })
+          }
+
+          if ($env:MODE -eq 'skip') {
+            Write-Host 'verify: mode is skip, so the files are unsigned and there is nothing to verify'
+            exit 0
+          }
+          if ($env:MODE -ne 'sign') {
+            Write-Host "::error::sign-windows verify: MODE is '$($env:MODE)', expected 'sign' or 'skip'"
+            exit 1
+          }
+
+          $publisher = [string]$env:SIGNING_PUBLISHER
+          if ($publisher -eq '') { $findings.Add('SIGNING_PUBLISHER is empty') }
+          $files = Split-Lines $env:FILES
+          $kept = Split-Lines $env:KEPT_FILES
+          if ($files.Count -eq 0) { $findings.Add('no files to verify') }
+
+          # Every file that was signed: Valid, timestamped, and signed by exactly the publisher (ordinal, case-sensitive).
+          foreach ($f in $files) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $findings.Add("file '$f' does not exist"); continue }
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            if ([string]$sig.Status -ne 'Valid') { $findings.Add("file '$f' is $($sig.Status) after signing"); continue }
+            $signer = Get-Signer $sig
+            $ok = $true
+            if (-not [string]::Equals($signer, $publisher, [System.StringComparison]::Ordinal)) {
+              $findings.Add("file '$f' is signed by '$signer', expected publisher '$publisher'")
+              $ok = $false
+            }
+            if ($null -eq $sig.TimeStamperCertificate) {
+              $findings.Add("file '$f' has no timestamp")
+              $ok = $false
+            }
+            if ($ok) { Write-Host "verified ${f}: Valid, signer '$signer', timestamped" }
+          }
+
+          # Every kept vendor file is still Valid.
+          foreach ($f in $kept) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $findings.Add("kept vendor file '$f' does not exist"); continue }
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            if ([string]$sig.Status -ne 'Valid') {
+              $findings.Add("kept vendor file '$f' is $($sig.Status), expected Valid")
+            } else {
+              Write-Host "kept vendor file ${f}: still Valid, signer '$(Get-Signer $sig)'"
+            }
+          }
+
+          if ($findings.Count -gt 0) {
+            foreach ($x in $findings) { Write-Host "::error::sign-windows verify: $x" }
+            Write-Host "::error::sign-windows verify: $($findings.Count) problem(s)"
+            exit 1
+          }
+          Write-Host "verify ok: $($files.Count) signed, $($kept.Count) kept"
 
       - name: Pack the zip and its checksum
         id: pack
@@ -414,7 +473,9 @@ jobs:
           PKG: ${{ steps.pkg.outputs.name }}
         run: |
           set -euo pipefail
-          exit 0
+          mkdir out
+          (cd in && 7z a "../out/$PKG.zip" "$PKG" > /dev/null)
+          (cd out && sha256sum "$PKG.zip" > "$PKG.zip.sha256")
 
       - name: Check that the zip holds the verified bytes
         id: check
@@ -423,7 +484,44 @@ jobs:
           PKG: ${{ steps.pkg.outputs.name }}
         run: |
           set -euo pipefail
-          exit 0
+          list_dir() {
+            local e names=()
+            for e in "$1"/* "$1"/.[!.]*; do
+              [ -e "$e" ] || continue
+              names+=("${e##*/}")
+            done
+            printf '%s\n' "${names[@]:-}" | LC_ALL=C sort | tr '\n' ' '
+          }
+          # out/ holds exactly the zip and its checksum.
+          listing=$(list_dir out)
+          if [ "$listing" != "$PKG.zip $PKG.zip.sha256 " ]; then
+            echo "::error::sign-windows check: out/ must hold exactly $PKG.zip and $PKG.zip.sha256; found: $listing"
+            exit 1
+          fi
+          # Extract the zip and compare the set of paths and every file's SHA-256 with in/$PKG.
+          rm -rf check
+          mkdir check
+          7z x "out/$PKG.zip" -ocheck -y > /dev/null
+          top=$(list_dir check)
+          if [ "$top" != "$PKG " ]; then
+            echo "::error::sign-windows check: the only top-level entry of the zip must be $PKG/; found: $top"
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          manifest() {
+            (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+          }
+          manifest "in/$PKG" > "$tmp/in.txt"
+          manifest "check/$PKG" > "$tmp/zip.txt"
+          if ! diff -q "$tmp/in.txt" "$tmp/zip.txt" > /dev/null; then
+            { diff "$tmp/in.txt" "$tmp/zip.txt" || true; } | { grep -E '^[<>] ' || true; } | sed -E 's/^[<>] [0-9a-f]{64} [ *]//' | LC_ALL=C sort -u | while IFS= read -r name; do
+              echo "::error::sign-windows check: '$name' differs between in/$PKG and the zip (missing, extra, or another hash)"
+            done
+            echo "::error::sign-windows check: the zip does not hold the bytes of in/$PKG"
+            exit 1
+          fi
+          (cd out && sha256sum -c "$PKG.zip.sha256")
+          echo "check ok: $(wc -l < "$tmp/in.txt") files in $PKG.zip equal in/$PKG"
 
       - name: Upload the signed package
         id: upload
