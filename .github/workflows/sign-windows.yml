@@ -61,18 +61,24 @@ jobs:
           $findings = New-Object System.Collections.Generic.List[string]
 
           # The parse rule of the three lists, written once per script (copying is cheaper than an unpinned checkout).
+          # System.Text.Json is strict. ConvertFrom-Json is not: PowerShell 7 reads '["a"' (no closing bracket) as a list.
           function Read-JsonList([string]$Name, [string]$Text) {
             try {
-              $v = ConvertFrom-Json -InputObject $Text -NoEnumerate
+              $doc = [System.Text.Json.JsonDocument]::Parse($Text)
             } catch {
               $findings.Add("$Name is not a JSON list")
               return $null
             }
-            if ($v -isnot [System.Array]) {
+            if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
               $findings.Add("$Name is not a JSON list")
               return $null
             }
-            return , $v
+            # A string stays a string; any other element is kept as a JsonElement, which prints as its JSON text.
+            $items = New-Object System.Collections.Generic.List[object]
+            foreach ($e in $doc.RootElement.EnumerateArray()) {
+              if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $items.Add($e.GetString()) } else { $items.Add($e.Clone()) }
+            }
+            return , $items.ToArray()
           }
           # The leading comma keeps the set from being unrolled into the pipeline (an empty set would become $null).
           function New-NameSet { return , [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
@@ -239,16 +245,21 @@ jobs:
 
           function Read-JsonList([string]$Name, [string]$Text) {
             try {
-              $v = ConvertFrom-Json -InputObject $Text -NoEnumerate
+              $doc = [System.Text.Json.JsonDocument]::Parse($Text)
             } catch {
               $findings.Add("$Name is not a JSON list")
               return $null
             }
-            if ($v -isnot [System.Array]) {
+            if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
               $findings.Add("$Name is not a JSON list")
               return $null
             }
-            return , $v
+            # A string stays a string; any other element is kept as a JsonElement, which prints as its JSON text.
+            $items = New-Object System.Collections.Generic.List[object]
+            foreach ($e in $doc.RootElement.EnumerateArray()) {
+              if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $items.Add($e.GetString()) } else { $items.Add($e.Clone()) }
+            }
+            return , $items.ToArray()
           }
           # The leading comma keeps the set from being unrolled into the pipeline (an empty set would become $null).
           function New-NameSet { return , [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
