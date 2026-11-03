@@ -33,7 +33,7 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 # Child processes. The exit code is read from the process object itself, so nothing can overwrite it.
 # ---------------------------------------------------------------------------------------------------------------
 $cleanEnvRe = '^(GITHUB_|ACTIONS_|AZURE_|SIGNING_|INPUT_)'
-$cleanEnvNames = @('REQUIRED', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR')
+$cleanEnvNames = @('REQUIRED', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR', 'PKG', 'MODE', 'FILES', 'KEPT_FILES')
 
 function Invoke-Child {
   param([string]$File, [string[]]$Arguments, [string]$WorkDir, [hashtable]$ChildEnv = @{})
@@ -152,7 +152,17 @@ function New-Tree([string]$CaseDir, $Tree) {
   }
 }
 
-# One run of one step of the workflow in a fresh tree. Returns the verdict of its assertions.
+# {PKG}, {SIGNER} and {SIGNER_LOWER} in case texts: the package directory of the case, and the signer simple name
+# the vendor fixture really has (read at run time).
+$script:signer = ''
+function Expand-Text([string]$Text, [string]$PkgDir) {
+  return $Text.Replace('{PKG}', $PkgDir).Replace('{SIGNER_LOWER}', $script:signer.ToLowerInvariant()).Replace('{SIGNER}', $script:signer)
+}
+
+# One case: a fresh tree, then one step (the case itself) or a chain of steps (Case.Steps) run in that tree.
+# In a chain the outputs of pkg, mode and inventory reach the later steps as env, as the workflow's env: does.
+# Step keys: Step, Env, Exit, Expect, NoOutput, Outputs, Prepare (scriptblock run before the step).
+# Returns $null when every assertion holds, else the reason.
 $caseCounter = 0
 function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
   $script:caseCounter++
@@ -160,7 +170,7 @@ function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
   $null = New-Item -ItemType Directory -Path $caseDir
   New-Tree $caseDir $Tree
   $pkgDir = Join-Path $caseDir 'in\pkg'
-  $stepEnv = @{
+  $base = @{
     ARTIFACTS = '["cli-win-x64"]'
     ARTIFACT = 'cli-win-x64'
     OWN_FILES = '["app.exe"]'
@@ -172,28 +182,47 @@ function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
     GITHUB_REF = 'refs/heads/main'
     ENVIRONMENT = 'release-signing'
   }
-  foreach ($v in $sixVars) { $stepEnv[$v] = '' }
-  if ($Case.Env) { foreach ($k in $Case.Env.Keys) { $stepEnv[$k] = [string]$Case.Env[$k] } }
+  foreach ($v in $sixVars) { $base[$v] = '' }
+  $flow = @{}
+  $steps = if ($Case.Steps) { @($Case.Steps) } else { @($Case) }
 
-  $r = Invoke-WorkflowStep -WorkflowFile $WorkflowFile -StepId $Case.Step -CaseDir $caseDir -StepEnv $stepEnv -ScratchDir $scratch
-  if ($r.RunStepFailed) { return "run-step.mjs exited $($r.ExitCode) for step '$($Case.Step)': $($r.Output.Trim())" }
+  foreach ($spec in $steps) {
+    if ($spec.Prepare) { & $spec.Prepare $caseDir $pkgDir }
+    $stepEnv = $base.Clone()
+    foreach ($k in $flow.Keys) { $stepEnv[$k] = $flow[$k] }
+    foreach ($src in @($Case.Env, $spec.Env)) {
+      if ($src) { foreach ($k in $src.Keys) { $stepEnv[$k] = Expand-Text ([string]$src[$k]) $pkgDir } }
+    }
 
-  $problems = New-Object System.Collections.Generic.List[string]
-  if ($r.ExitCode -ne $Case.Exit) { $problems.Add("exit code $($r.ExitCode), expected $($Case.Exit)") }
-  foreach ($frag in @($Case.Expect)) {
-    if ($r.Output.IndexOf($frag, [System.StringComparison]::Ordinal) -lt 0) { $problems.Add("output lacks '$frag'") }
-  }
-  if ($Case.NoOutput -and $r.OutputText.Trim() -ne '') { $problems.Add("outputs were written but none expected: $($r.OutputText.Trim() -replace "`n", ' | ')") }
-  if ($Case.Outputs) {
-    foreach ($name in $Case.Outputs.Keys) {
-      $want = ([string]$Case.Outputs[$name]).Replace('{PKG}', $pkgDir)
-      if (-not $r.Outputs.Contains($name)) { $problems.Add("output '$name' is missing"); continue }
-      if ($r.Outputs[$name] -ine $want) { $problems.Add("output '$name' is '$($r.Outputs[$name] -replace "`n", ' | ')', expected '$($want -replace "`n", ' | ')'") }
+    $r = Invoke-WorkflowStep -WorkflowFile $WorkflowFile -StepId $spec.Step -CaseDir $caseDir -StepEnv $stepEnv -ScratchDir $scratch
+    if ($r.RunStepFailed) { return "run-step.mjs exited $($r.ExitCode) for step '$($spec.Step)': $($r.Output.Trim())" }
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $wantExit = if ($null -ne $spec.Exit) { $spec.Exit } else { 0 }
+    if ($r.ExitCode -ne $wantExit) { $problems.Add("exit code $($r.ExitCode), expected $wantExit") }
+    foreach ($frag in @($spec.Expect)) {
+      $want = Expand-Text ([string]$frag) $pkgDir
+      if ($r.Output.IndexOf($want, [System.StringComparison]::Ordinal) -lt 0) { $problems.Add("output lacks '$want'") }
+    }
+    if ($spec.NoOutput -and $r.OutputText.Trim() -ne '') { $problems.Add("outputs were written but none expected: $($r.OutputText.Trim() -replace "`n", ' | ')") }
+    if ($spec.Outputs) {
+      foreach ($name in $spec.Outputs.Keys) {
+        $want = Expand-Text ([string]$spec.Outputs[$name]) $pkgDir
+        if (-not $r.Outputs.Contains($name)) { $problems.Add("output '$name' is missing"); continue }
+        if ($r.Outputs[$name] -ine $want) { $problems.Add("output '$name' is '$($r.Outputs[$name] -replace "`n", ' | ')', expected '$($want -replace "`n", ' | ')'") }
+      }
+    }
+    if ($problems.Count -gt 0) {
+      return "step '$($spec.Step)': " + ($problems -join '; ') + " [output: " + (($r.Output.Trim() -replace '\s*\r?\n\s*', ' / ')) + "]"
+    }
+
+    switch ($spec.Step) {
+      'pkg' { $flow['PKG_DIR'] = $r.Outputs['dir']; $flow['PKG_NAME'] = $r.Outputs['name']; $flow['PKG'] = $r.Outputs['name'] }
+      'mode' { $flow['MODE'] = $r.Outputs['mode'] }
+      'inventory' { $flow['FILES'] = $r.Outputs['files']; $flow['KEPT_FILES'] = $r.Outputs['kept-files'] }
     }
   }
-  if ($problems.Count -gt 0) {
-    return ($problems -join '; ') + " [output: " + (($r.Output.Trim() -replace '\s*\r?\n\s*', ' / ')) + "]"
-  }
+  if ($Case.Final) { return (& $Case.Final $caseDir) }
   return $null
 }
 
@@ -221,9 +250,23 @@ $cases = @(
   @{ Id = '5'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/app.exe' = 'vendor.exe' }); Exit = 1; Expect = @("own file 'app.exe' is Valid"); NoOutput = $true }
   @{ Id = '6'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/vendor-flipped.exe' = 'vendor-flipped.exe' }); Exit = 1; Expect = @("file 'vendor-flipped.exe' has signature status HashMismatch"); NoOutput = $true }
   @{ Id = '7'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/extra.dll' = 'extra.dll' }); Exit = 1; Expect = @("unsigned file 'extra.dll' is neither an own file"); NoOutput = $true }
-  @{ Id = '8'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/extra.dll' = 'extra.dll' }); Env = @{ EXTRA_FILES = '["extra.dll"]' }; Exit = 0
-     Expect = @("extra file extra.dll: NotSigned, matched 'extra.dll'")
-     Outputs = [ordered]@{ count = '2'; files = "{PKG}\app.exe`n{PKG}\extra.dll"; 'kept-count' = '1'; 'kept-files' = '{PKG}\vendor.exe' } }
+  # Case 8 runs the whole road of an extra file: mode, pkg, inventory, verify (skip), pack and check, all green.
+  @{ Id = '8'; Tree = (With-Tree -Add @{ 'in/pkg/extra.dll' = 'extra.dll' }); Env = @{ EXTRA_FILES = '["extra.dll"]' }
+     Steps = @(
+       @{ Step = 'mode'; Expect = @('UNSIGNED trial'); Outputs = @{ mode = 'skip' } },
+       @{ Step = 'pkg'; Outputs = @{ name = 'pkg' } },
+       @{ Step = 'inventory'; Expect = @("extra file extra.dll: NotSigned, matched 'extra.dll'")
+          Outputs = [ordered]@{ count = '2'; files = "{PKG}\app.exe`n{PKG}\extra.dll"; 'kept-count' = '1'; 'kept-files' = '{PKG}\vendor.exe' } },
+       @{ Step = 'verify'; Expect = @('unsigned') },
+       @{ Step = 'pack' },
+       @{ Step = 'check' }
+     )
+     Final = {
+       param($caseDir)
+       $names = @(Get-ChildItem -LiteralPath (Join-Path $caseDir 'out') -Name | Sort-Object)
+       if (($names -join ',') -ne 'pkg.zip,pkg.zip.sha256') { return "out/ holds '$($names -join ', ')', expected pkg.zip and pkg.zip.sha256" }
+       return $null
+     } }
   @{ Id = 'S1.A1'; Step = 'inputs'; Env = @{ OWN_FILES = '["creds.exe"' }; Exit = 1; Expect = @('own-files is not a JSON list') }
   @{ Id = 'S1.A2'; Step = 'inputs'; Env = @{ ARTIFACTS = '["cli win"]'; OWN_FILES = '["../x.exe"]' }; Exit = 1; Expect = @("artifact name 'cli win'", "own-files entry '../x.exe'") }
   @{ Id = 'S1.A3'; Step = 'inputs'; Env = @{ OWN_FILES = '[]' }; Exit = 1; Expect = @('own-files is empty') }
@@ -243,6 +286,26 @@ $cases = @(
      ) }
   @{ Id = 'E1.A2'; Step = 'mode'; Env = $fifthMissing; Exit = 1; Expect = @('partial signing configuration', 'missing SIGNING_PUBLISHER'); NoOutput = $true }
   @{ Id = 'E1.A3'; Step = 'inventory'; Tree = (With-Tree -Add @{ 'in/pkg/sub/app.exe' = 'app.exe' }); Exit = 1; Expect = @("unsigned file 'sub/app.exe' is neither an own file"); NoOutput = $true }
+  # E1.A4: pack ran, then one file under in/pkg changes: check is red and names the file.
+  @{ Id = 'E1.A4'
+     Steps = @(
+       @{ Step = 'pkg' },
+       @{ Step = 'pack' },
+       @{ Step = 'check'; Exit = 1; Expect = @('app.exe'); NoOutput = $true
+          Prepare = {
+            param($caseDir, $pkgDir)
+            $fs = [System.IO.File]::Open((Join-Path $pkgDir 'app.exe'), [System.IO.FileMode]::Append)
+            try { $fs.WriteByte(0) } finally { $fs.Dispose() }
+          } }
+     ) }
+  # The verify step, without Azure: the signer and the status are read from files that are signed already.
+  @{ Id = 'V-pos'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = '{SIGNER}' }; Exit = 0; Expect = @('verified ', 'timestamped') }
+  @{ Id = 'V-pub'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = 'Wrong Org' }; Exit = 1; Expect = @('vendor.exe', "signed by '{SIGNER}'", "expected publisher 'Wrong Org'") }
+  @{ Id = 'V-case'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = '{SIGNER_LOWER}' }; Exit = 1; Expect = @('vendor.exe', "expected publisher '{SIGNER_LOWER}'") }
+  @{ Id = 'V-unsigned'; Step = 'verify'; Env = @{ MODE = 'sign'; FILES = '{PKG}\app.exe'; KEPT_FILES = ''; SIGNING_PUBLISHER = '{SIGNER}' }; Exit = 1; Expect = @('app.exe', 'NotSigned') }
+  @{ Id = 'V-kept'; Step = 'verify'; Tree = (With-Tree -Add @{ 'in/pkg/vendor-flipped.exe' = 'vendor-flipped.exe' })
+     Env = @{ MODE = 'sign'; FILES = '{PKG}\vendor.exe'; KEPT_FILES = '{PKG}\vendor-flipped.exe'; SIGNING_PUBLISHER = '{SIGNER}' }; Exit = 1; Expect = @('vendor-flipped.exe', 'HashMismatch') }
+  @{ Id = 'V-skip'; Step = 'verify'; Env = @{ MODE = 'skip'; FILES = '{PKG}\app.exe'; KEPT_FILES = '' }; Exit = 0; Expect = @('unsigned') }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
@@ -286,6 +349,11 @@ try {
     $failed++
     throw
   }
+
+  $vendorSig = Get-AuthenticodeSignature -LiteralPath (Join-Path $fixDir 'vendor.exe')
+  $script:signer = [string]$vendorSig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+  if (($script:signer -eq '') -or ($script:signer -ceq $script:signer.ToLowerInvariant())) { throw "fixture premise broken: the vendor signer '$($script:signer)' must be non-empty and have an upper-case letter" }
+  Write-Host "vendor signer: '$($script:signer)'"
 
   foreach ($case in $cases) {
     $reason = $null
