@@ -242,6 +242,12 @@ $fifthMissing['REQUIRED'] = 'true'
 $allSix = @{}
 foreach ($v in $sixVars) { $allSix[$v] = 'x' }
 
+# 200 and 199 declared copies of an unsigned PE, for the bound on the signing list.
+$manyExtras = @{}
+foreach ($n in 1..200) { $manyExtras[('in/pkg/x{0:D3}.dll' -f $n)] = 'extra.dll' }
+$fewExtras = @{}
+foreach ($n in 1..199) { $fewExtras[('in/pkg/x{0:D3}.dll' -f $n)] = 'extra.dll' }
+
 $cases = @(
   @{ Id = '2'; Step = 'mode'; Env = @{ REQUIRED = 'true' }; Exit = 1; Expect = @('signing is required'); NoOutput = $true }
   @{ Id = '3'; Step = 'mode'; Env = @{ AZURE_CLIENT_ID = 'x' }; Exit = 1; Expect = @('partial signing configuration', 'missing AZURE_TENANT_ID'); NoOutput = $true }
@@ -319,6 +325,9 @@ $cases = @(
   # C: the package folder name has no leading dash (7z would read it as a switch) and no comma (the signing action splits on it).
   @{ Id = 'C.dash'; Step = 'pkg'; Tree = [ordered]@{ 'in/-x' = '<dir>' }; Exit = 1; Expect = @("package folder name '-x'"); NoOutput = $true }
   @{ Id = 'C.comma'; Step = 'pkg'; Tree = [ordered]@{ 'in/a,b' = '<dir>' }; Exit = 1; Expect = @("package folder name 'a,b'"); NoOutput = $true }
+  # E: more than 200 files to sign is one finding (the list travels through an environment variable).
+  @{ Id = 'E.201'; Step = 'inventory'; Tree = (With-Tree -Add $manyExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 1; Expect = @('more than 200 files to sign'); NoOutput = $true }
+  @{ Id = 'E.200'; Step = 'inventory'; Tree = (With-Tree -Add $fewExtras); Env = @{ EXTRA_FILES = '["x*.dll"]' }; Exit = 0; Outputs = @{ count = '200' } }
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
