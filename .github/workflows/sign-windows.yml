@@ -306,9 +306,20 @@ jobs:
           }
           if ($findings.Count -gt 0) { Stop-Red }
 
-          # 2. Every PE below the package directory (case-insensitive extension).
+          # 2. Every PE below the package directory: a .exe or .dll (case-insensitive), or any file whose first two bytes are
+          # 'MZ', whatever it is called. A renamed unsigned apphost must not slip past the inventory.
+          function Test-Mz([string]$Path) {
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+              $b = New-Object byte[] 2
+              $n = $fs.Read($b, 0, 2)
+              return (($n -eq 2) -and ($b[0] -eq 0x4D) -and ($b[1] -eq 0x5A))
+            } finally {
+              $fs.Dispose()
+            }
+          }
           $root = (Resolve-Path -LiteralPath $env:PKG_DIR).ProviderPath.TrimEnd('\')
-          $peFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object { $_.Extension -in '.exe', '.dll' })
+          $peFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object { ($_.Extension -in '.exe', '.dll') -or (Test-Mz $_.FullName) })
           $byRel = @{}
           foreach ($f in $peFiles) {
             $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
