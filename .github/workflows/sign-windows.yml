@@ -167,6 +167,11 @@ jobs:
             exit 1
           }
           $name = $items[0].Name
+          # No leading dash (7z would read the name as a switch) and no comma (the signing action splits its files on it).
+          if (-not [regex]::IsMatch($name, '^[A-Za-z0-9][A-Za-z0-9._-]*\z')) {
+            Write-Host "::error::sign-windows: package folder name '$name' is not ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            exit 1
+          }
           $dir = (Resolve-Path -LiteralPath $items[0].FullName).ProviderPath
           $out = @("name=$name", "dir=$dir")
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, (($out -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
