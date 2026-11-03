@@ -158,8 +158,8 @@ jobs:
           # 1. The artifact holds exactly the zip and its checksum.
           listing=$(list_dir out)
           [ "$listing" = "$PKG.zip $PKG.zip.sha256 " ] || fail "out holds '$listing', expected $PKG.zip and $PKG.zip.sha256"
-          # 2. Every entry of the zip is under PKG/: the only top-level entry is PKG/.
-          entries=$(7z l -ba -slt "out/$PKG.zip" | sed -n 's/^Path = //p' | tr -d '\r')
+          # 2. Every entry of the zip is under PKG/: the only top-level entry is PKG/. (7z on Windows prints backslashes.)
+          entries=$(7z l -ba -slt "out/$PKG.zip" | sed -n 's/^Path = //p' | tr -d '\r' | tr '\\' '/')
           [ -n "$entries" ] || fail "the zip lists no entries"
           while IFS= read -r entry; do
             case "$entry" in
