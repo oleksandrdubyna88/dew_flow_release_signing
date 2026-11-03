@@ -163,7 +163,7 @@ jobs:
                 if ($_.PSIsContainer) { "$($_.Name) (dir)" } else { "$($_.Name) (file)" }
               })) -join ', '
             }
-            Write-Host "::error::sign-windows: in/ must hold exactly one directory and nothing else; found: $found"
+            Write-Host "::error::sign-windows: in/ must hold exactly one directory and nothing else; found: $found. If the package folder itself was uploaded, upload its PARENT so the folder survives (actions/upload-artifact keeps the contents of a directory path, not the directory)."
             exit 1
           }
           $name = $items[0].Name
