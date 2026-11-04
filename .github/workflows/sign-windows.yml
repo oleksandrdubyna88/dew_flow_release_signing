@@ -2,6 +2,7 @@ name: sign windows
 
 # Reusable workflow: Windows Authenticode signing with Azure Artifact Signing.
 # Contract: dew_flow_creds_for_devs, todo/PLAN_windows_code_signing_E1_S1_spec.md.
+# v1.1.0: allow-unsigned-release is a permission for MISSING configuration (zero variables on a forced leg), never an off switch; callers remove it at activation (A6)
 # Rule for every step of this file: no ${{ }} inside run:. Every value reaches a script through env:.
 
 on:
@@ -604,7 +605,7 @@ jobs:
           (cd out && sha256sum -c "$PKG.zip.sha256")
           echo "check ok: $(wc -l < "$tmp/in.txt") files in $PKG.zip equal the verified files"
 
-      - name: Upload the signed package
+      - name: Upload the package
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

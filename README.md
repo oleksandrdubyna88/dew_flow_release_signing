@@ -9,7 +9,8 @@ artifact `unsigned-NAME`. For every NAME in `artifacts` (one matrix leg each, on
 
 1. checks the three JSON inputs (`inputs` step);
 2. downloads `unsigned-NAME` into `in/` and checks that `in/` holds exactly one directory, the package folder (`pkg` step);
-3. decides `sign`, `skip` or red from the six signing variables of the caller's environment (`mode` step);
+3. decides `sign`, `skip` or red from the six signing variables of the caller's environment and the
+   `allow-unsigned-release` input (`mode` step);
 4. lists the binaries: the caller's own files must arrive unsigned, other unsigned files must be declared in
    `extra-files`, vendor-signed files must still be `Valid` (`inventory` step, before any login, in every mode).
    A PE is found by its content: every file whose first two bytes are `MZ` counts, whatever its name (`helper.bin`,
@@ -37,19 +38,35 @@ The workflow builds nothing, publishes nothing and reads no secret. The caller o
   true: missing configuration or any failure is red. Independently, a caller ref under refs/tags/ is treated as required.
 - `environment` (string, optional, default `release-signing`)
   The caller's environment that holds AZURE_CLIENT_ID, AZURE_TENANT_ID, SIGNING_ENDPOINT, SIGNING_ACCOUNT, SIGNING_PROFILE, SIGNING_PUBLISHER and the OIDC trust.
+- `allow-unsigned-release` (boolean, optional, default `false`)
+  A permission for MISSING configuration, not an off switch. true: a forced leg (required: true, or a caller ref under refs/tags/) whose environment holds NONE of the six signing variables takes skip and packs the release unsigned, with a ::warning:: and a job-summary banner UNSIGNED RELEASE. It changes nothing else: one to five variables set is red, all six set signs, and a login, signing or verify failure is red. For the period before a signing provider exists; callers remove it at activation.
 
 The six variables of the caller's `environment` (none is a secret): `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
 `SIGNING_ENDPOINT`, `SIGNING_ACCOUNT`, `SIGNING_PROFILE`, `SIGNING_PUBLISHER`.
 
-| Variables set | Forced (`required: true`, or the caller ref is under `refs/tags/`) | Result |
-|---|---|---|
-| all six | any | sign |
-| none | no | skip: an UNSIGNED trial, with a warning |
-| none | yes | red, naming the six variables |
-| one to five | any | red: a half configuration is never a skip |
+| Variables set | Forced (`required: true`, or the caller ref is under `refs/tags/`) | `allow-unsigned-release` | Result |
+|---|---|---|---|
+| all six | any | any | sign |
+| none | no | any | skip: an UNSIGNED trial, with a warning |
+| none | yes | `false` (or absent) | red, naming the six variables |
+| none | yes | `true` | skip: an UNSIGNED RELEASE, with a warning and a job-summary banner |
+| one to five | any | any | red: a half configuration is never a skip |
+
+`allow-unsigned-release` is for the period before a signing provider exists. A caller passes it from a repository
+variable, so that an absent variable means enforcement:
+`allow-unsigned-release: ${{ vars.ALLOW_UNSIGNED_RELEASES == 'true' }}`. The variable `ALLOW_UNSIGNED_RELEASES` is a
+**repository** variable (Settings, Secrets and variables, Actions, Variables), not an environment variable: a caller job
+that uses a reusable workflow cannot read its environment's variables, so an environment-level setting would be ignored
+and the tag would be red. The input (`allow-unsigned-release`) and the variable (`ALLOW_UNSIGNED_RELEASES`) are named
+apart on purpose. At activation the owner deletes the variable **and** the callers remove the input in code (A6); then
+no variable can bring the exception back. The input cannot skip a partial configuration, a failing provider or a failed
+verify.
 
 A job that names an environment the caller's repository does not have makes GitHub create it, empty. A typo in
-`environment` is therefore not an error: a trial takes `skip`, a tag is red. Every message names the environment.
+`environment` is therefore not an error: a trial takes `skip`, a tag is red — or, with allow-unsigned-release true, an
+unsigned release with the banner. With the permission on, a mistyped `environment` (auto-created, empty) is an unsigned
+release with the banner, not an error; this is accepted while the permission is on, because the callers use the default
+name and A6 removes the permission. Every message names the environment.
 
 ## Limits and rules for the package
 
@@ -80,7 +97,9 @@ A job that names an environment the caller's repository does not have makes GitH
 - Only declared files are signed: own files (exact package-relative paths) and unsigned files that match
   `extra-files`. An unsigned PE that nobody declared is red.
 - An own file must arrive unsigned. A vendor-signed file named as the product's binary is red.
-- A tag ref always requires signing, whatever `required` says.
+- A tag ref is always FORCED, whatever `required` says: with zero variables it is red, unless the caller passes
+  allow-unsigned-release: true, which packs it unsigned and says so in a warning and a banner. With one to five
+  variables it is red in every case; with six it signs.
 - There is no secret. Values come from `vars`, and no `${{ }}` expression is written inside any `run:`: every value
   reaches a script through `env:`. The self-test refuses a workflow that breaks this rule.
 - The top level is `permissions: {}`. The job has `contents: read` and `id-token: write` only. A caller job must grant
@@ -108,18 +127,21 @@ cli-sign:
   permissions:
     contents: read
     id-token: write
-  uses: oleksandrdubyna88/dew_flow_release_signing/.github/workflows/sign-windows.yml@<40-hex> # v1.0.0
+  uses: oleksandrdubyna88/dew_flow_release_signing/.github/workflows/sign-windows.yml@<40-hex> # v1.1.0
   with:
     artifacts: '["cli-win-x64","cli-win-arm64"]'
     own-files: '["creds.exe"]'
     required: ${{ startsWith(github.ref, 'refs/tags/') }}
+    allow-unsigned-release: ${{ vars.ALLOW_UNSIGNED_RELEASES == 'true' }}   # until activation (A6)
 ```
+
+`ALLOW_UNSIGNED_RELEASES` is a repository variable (see above), the input is `allow-unsigned-release`.
 
 Pin the 40-hex SHA of a release tag, never a branch.
 
 ## Owner setup, once
 
-Summary of O1 to O9. The full text is in `dew_flow_creds_for_devs · todo/PLAN_windows_code_signing.md` section 4.
+Summary of O1 to O9, M1, M2 and A6. The full text is in `dew_flow_creds_for_devs · todo/PLAN_windows_code_signing.md` section 4.
 
 - O1: an Azure subscription in the owner's Entra tenant.
 - O2: register the `Microsoft.CodeSigning` provider on it.
@@ -129,10 +151,14 @@ Summary of O1 to O9. The full text is in `dew_flow_creds_for_devs · todo/PLAN_w
   (`SIGNING_PUBLISHER`).
 - O6: a user-assigned managed identity with the role *Artifact Signing Certificate Profile Signer* on the profile, and
   one federated credential per caller repository for its environment `release-signing`.
-- O7: in each caller repository, an environment `release-signing` limited to the release branches and tags, holding the
-  six variables. Until the merge the rule also admits the PR branch.
+- O7: in each caller repository, an environment `release-signing` limited to the release branches and tags. It holds
+  **zero** variables until the activation cutover, then the six, set in one sitting with releases paused. The
+  deployment rule admits `main` and the release tags (the PR branches were admitted until the merge and removed by O9).
 - O8: re-read the tag ruleset, the guard that makes a tag a human decision.
 - O9: after the merge, remove the PR branches from the deployment rules.
+- M1: before the merge of a caller, set the repository variable `ALLOW_UNSIGNED_RELEASES=true` in that caller.
+- M2: the environment `release-signing` exists in each caller and is empty.
+- A6: at activation, delete the variable and remove the `allow-unsigned-release` input from the callers in code.
 
 ## Self-test
 
@@ -140,9 +166,13 @@ CI (`.github/workflows/ci.yml`) runs on every branch push and pull request:
 
 - `lint`: actionlint (pinned by version and SHA-256) with shellcheck over the `run:` blocks;
 - `harness`: `test/selftest.ps1` runs single steps of `sign-windows.yml` the way the GitHub runner runs them, one case
-  at a time, and prints `case ID: pass` or `case ID: FAIL`;
-- `trial-input`, `trial-call`, `trial-check`: one real call in the unsigned trial road (environment
-  `selftest-no-signing`, which never holds variables) and the checks of its result.
+  at a time, and prints `case ID: pass` or `case ID: FAIL`; then `test/wiring.mjs` checks that the `mode` step reads
+  `allow-unsigned-release` from the input and from nothing else;
+- `trial-input` builds the package for both real calls; `trial-call`, `trial-check`: the real call in the unsigned
+  trial road (environment `selftest-no-signing`, which never holds variables) and the checks of its result;
+  `trial-call-forced`, `trial-check-forced`: the real forced-and-permitted call, green in skip mode with the banner, and
+  the same checks;
+- `all-green` (`ci · all green`): red unless every other job succeeded; it is the one required check.
 
 To run the harness on a Windows machine with PowerShell 7, Git for Windows, 7-Zip and the .NET SDK:
 
@@ -152,8 +182,8 @@ pwsh -File test/selftest.ps1
 ```
 
 The fixtures are made at run time in a folder whose path has a space, and removed at the end. Nothing binary is
-committed. The `sign` road needs Azure. V1 proves it: a dry run on the caller's PR branch before its merge
-(`dew_flow_creds_for_devs · todo/PLAN_windows_code_signing.md` section 5).
+committed. The `sign` road needs Azure. V1 proves it: a signed dispatch trial on the caller's main during the activation cutover
+(`dew_flow_creds_for_devs · todo/PLAN_windows_code_signing.md` section 3.4).
 
 ## License
 
