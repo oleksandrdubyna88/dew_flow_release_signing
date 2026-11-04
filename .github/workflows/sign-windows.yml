@@ -2,6 +2,7 @@ name: sign windows
 
 # Reusable workflow: Windows Authenticode signing with Azure Artifact Signing.
 # Contract: dew_flow_creds_for_devs, todo/PLAN_windows_code_signing_E1_S1_spec.md.
+# v1.1.0: allow-unsigned-release is a permission for MISSING configuration (zero variables on a forced leg), never an off switch; callers remove it at activation (A6)
 # Rule for every step of this file: no ${{ }} inside run:. Every value reaches a script through env:.
 
 on:
@@ -29,6 +30,11 @@ on:
         type: string
         required: false
         default: release-signing
+      allow-unsigned-release:
+        description: 'A permission for MISSING configuration, not an off switch. true: a forced leg (required: true, or a caller ref under refs/tags/) whose environment holds NONE of the six signing variables takes skip and packs the release unsigned, with a ::warning:: and a job-summary banner UNSIGNED RELEASE. It changes nothing else: one to five variables set is red, all six set signs, and a login, signing or verify failure is red. For the period before a signing provider exists; callers remove it at activation.'
+        type: boolean
+        required: false
+        default: false
 
 permissions: {}
 
@@ -188,6 +194,7 @@ jobs:
           SIGNING_PROFILE: ${{ vars.SIGNING_PROFILE }}
           SIGNING_PUBLISHER: ${{ vars.SIGNING_PUBLISHER }}
           REQUIRED: ${{ inputs.required }}
+          ALLOW_UNSIGNED_RELEASE: ${{ inputs.allow-unsigned-release }}
           ENVIRONMENT: ${{ inputs.environment }}
           ARTIFACT: ${{ matrix.artifact }}
         run: |
@@ -210,6 +217,12 @@ jobs:
             done
             printf '%s' "$out"
           }
+          # The banner for the job summary (Markdown); the caller of the function appends it to GITHUB_STEP_SUMMARY.
+          write_banner() {
+            printf '## UNSIGNED RELEASE\n\n'
+            printf "\`%s\` is packed **unsigned**: none of the six signing variables is set in environment \`%s\` and \`allow-unsigned-release\` is \`true\` (required=%s, caller ref \`%s\`).\n\n" "${ARTIFACT:-}" "${ENVIRONMENT:-}" "${REQUIRED:-}" "${GITHUB_REF:-}"
+            printf "This exception is for the period before a signing provider exists. At activation the caller removes the \`allow-unsigned-release\` input; from then on a release without signing is red.\n"
+          }
           forced=no
           if [ "${REQUIRED:-}" = true ]; then
             forced=yes
@@ -229,6 +242,17 @@ jobs:
             exit 0
           fi
           if [ "$forced" = yes ]; then
+            # The permission acts here only: zero variables on a forced leg. Never on a partial or a full configuration.
+            if [ "${ALLOW_UNSIGNED_RELEASE:-}" = true ]; then
+              if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "::error::sign-windows: GITHUB_STEP_SUMMARY is not set, so the UNSIGNED RELEASE banner cannot be written; ${ARTIFACT:-} is not packed unsigned without it"
+                exit 1
+              fi
+              write_banner >> "$GITHUB_STEP_SUMMARY"
+              echo "mode=skip" >> "$GITHUB_OUTPUT"
+              echo "::warning::sign-windows: UNSIGNED RELEASE — signing is required (required=${REQUIRED:-}, caller ref ${GITHUB_REF:-}) but none of the six signing variables is set in environment '${ENVIRONMENT:-}', and allow-unsigned-release is true; ${ARTIFACT:-} is packed unsigned"
+              exit 0
+            fi
             echo "::error::sign-windows: signing is required (required=${REQUIRED:-}, caller ref ${GITHUB_REF:-}) but none of AZURE_CLIENT_ID, AZURE_TENANT_ID, SIGNING_ENDPOINT, SIGNING_ACCOUNT, SIGNING_PROFILE, SIGNING_PUBLISHER is set in environment '${ENVIRONMENT:-}'"
             exit 1
           fi
@@ -581,7 +605,7 @@ jobs:
           (cd out && sha256sum -c "$PKG.zip.sha256")
           echo "check ok: $(wc -l < "$tmp/in.txt") files in $PKG.zip equal the verified files"
 
-      - name: Upload the signed package
+      - name: Upload the package
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
