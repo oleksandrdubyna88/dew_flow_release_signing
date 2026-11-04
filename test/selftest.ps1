@@ -498,7 +498,11 @@ try {
       foreach ($tree in $trees) {
         foreach ($variant in $variants) {
           $reason = Test-StepRun $variant $tree $workflowPath
-          if ($reason) { break }
+          if ($reason) {
+            # A case that loops over environments names the variant: here, how many of the six variables are set.
+            if ($case.Envs) { $n = @($sixVars | Where-Object { $variant.Env.ContainsKey($_) }).Count; $reason = "with $n of the six variables set: $reason" }
+            break
+          }
         }
         if ($reason) { break }
       }
