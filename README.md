@@ -57,15 +57,16 @@ variable, so that an absent variable means enforcement:
 `allow-unsigned-release: ${{ vars.ALLOW_UNSIGNED_RELEASES == 'true' }}`. The variable `ALLOW_UNSIGNED_RELEASES` is a
 **repository** variable (Settings, Secrets and variables, Actions, Variables), not an environment variable: a caller job
 that uses a reusable workflow cannot read its environment's variables, so an environment-level setting would be ignored
-and the tag would be red. The input (`allow-unsigned-release`) and the variable (`ALLOW_UNSIGNED_RELEASES`) are named
+and the tag would be red. It is repository-level — not organization-level (an organization variable is also visible
+through `vars.`); setting it needs repository admin; after A6 no variable at any level matters, because the input is
+gone from the callers. The input (`allow-unsigned-release`) and the variable (`ALLOW_UNSIGNED_RELEASES`) are named
 apart on purpose. At activation the owner deletes the variable **and** the callers remove the input in code (A6); then
 no variable can bring the exception back. The input cannot skip a partial configuration, a failing provider or a failed
 verify.
 
 A job that names an environment the caller's repository does not have makes GitHub create it, empty. A typo in
 `environment` is therefore not an error: a trial takes `skip`, a tag is red — or, with allow-unsigned-release true, an
-unsigned release with the banner. With the permission on, a mistyped `environment` (auto-created, empty) is an unsigned
-release with the banner, not an error; this is accepted while the permission is on, because the callers use the default
+unsigned release with the banner. This is accepted while the permission is on, because the callers use the default
 name and A6 removes the permission. Every message names the environment.
 
 ## Limits and rules for the package
@@ -172,7 +173,8 @@ CI (`.github/workflows/ci.yml`) runs on every branch push and pull request:
   trial road (environment `selftest-no-signing`, which never holds variables) and the checks of its result;
   `trial-call-forced`, `trial-check-forced`: the real forced-and-permitted call, green in skip mode with the banner, and
   the same checks;
-- `all-green` (`ci · all green`): red unless every other job succeeded; it is the one required check.
+- `all-green` (`ci · all green`): red unless every other job succeeded; it is the gate that must be green. The five
+  existing checks stay required.
 
 To run the harness on a Windows machine with PowerShell 7, Git for Windows, 7-Zip and the .NET SDK:
 
