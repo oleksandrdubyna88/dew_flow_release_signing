@@ -4,8 +4,9 @@ name: ci
 # download-artifact.
 # No setup-node: the runner's own node runs the harness.
 
-# push: every branch, never a tag. A tag ref makes sign-windows treat signing as required, and the trial call has no
-# signing variables on purpose.
+# push: every branch, never a tag. A tag ref makes sign-windows treat the leg as forced: the trial call has no signing
+# variables on purpose, so a tag would be red there, and with allow-unsigned-release (trial-call-forced) it would be green
+# for the wrong reason. The forced call must be forced by required: true, not by a ref.
 on:
   push:
     branches: ['**']
@@ -67,8 +68,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           ./test/selftest.ps1
 
-  # The one real call of sign-windows.yml (case 1): the package has an own file and a vendor file, and the called
-  # environment never holds variables, so the call takes the unsigned trial road.
+      # The harness sets the environment of a step itself, so it cannot see the workflow's env: block. This check pins
+      # the SOURCE of the allow-unsigned-release mapping, which neither the harness nor the two real calls can see.
+      - name: Check the wiring of allow-unsigned-release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node test/wiring.mjs .github/workflows/sign-windows.yml
+          if ($LASTEXITCODE -ne 0) { throw "wiring.mjs exited $LASTEXITCODE" }
+
+  # The package for both real calls of sign-windows.yml: trial-call (case 1, the unsigned trial road) and
+  # trial-call-forced (R2, forced and permitted). It has an own file and a vendor file, and the called environment
+  # never holds variables.
   trial-input:
     name: trial · build the unsigned package
     runs-on: windows-2025
@@ -93,10 +104,19 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $fix 'vendor.exe') -Destination (Join-Path $pkg 'dotnet.exe')
           Get-ChildItem -Recurse -File $pkg | ForEach-Object { Write-Host "$($_.FullName) $((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)" }
 
-      - name: Upload the unsigned package
+      - name: Upload the unsigned package for trial-call
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-selftest-win-x64
+          path: unsigned/
+          if-no-files-found: error
+          retention-days: 7
+
+      # The same folder under a second name: the called workflow reads unsigned-NAME for each leg.
+      - name: Upload the unsigned package for trial-call-forced
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-selftest-forced-win-x64
           path: unsigned/
           if-no-files-found: error
           retention-days: 7
@@ -182,3 +202,169 @@ jobs:
           # 4. The checksum file passes.
           (cd out && sha256sum -c "$PKG.zip.sha256")
           echo "case 1 ok: $(wc -l < in.txt) files, layout $PKG/, checksum passes"
+
+  # The only proof that the allow-unsigned-release input reaches the mode step: the harness supplies that step's
+  # environment itself, so it is green whether or not the workflow's env: line exists (consultation 96bf9488). This call
+  # is forced by required: true (never by a ref) and permitted by the input; its environment never holds variables, so it
+  # must take the unsigned-release row and stay green. If the mapping is deleted it is red at mode ("signing is required").
+  trial-call-forced:
+    name: trial · call sign-windows (forced)
+    needs: trial-input
+    # A caller must grant what the called job asks for.
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/sign-windows.yml
+    with:
+      artifacts: '["selftest-forced-win-x64"]'
+      own-files: '["selftest.exe"]'
+      required: true
+      allow-unsigned-release: true
+      environment: selftest-no-signing
+
+  # The assertion text of trial-check is copied here on purpose: a shared script would need a checkout the called
+  # workflow does not do, and a drift between two copies is visible in one diff.
+  trial-check-forced:
+    name: trial · check the forced result
+    needs: [trial-input, trial-call-forced]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - name: Download the input and the result
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-selftest-forced-win-x64
+          path: unsigned
+
+      - name: Download the result of the forced call
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: selftest-forced-win-x64
+          path: out
+
+      - name: Assert case 1 on the forced result
+        shell: bash
+        env:
+          PKG: selftest-0.0.0-win-x64
+        run: |
+          set -euo pipefail
+          list_dir() {
+            local e names=()
+            for e in "$1"/* "$1"/.[!.]*; do
+              [ -e "$e" ] || continue
+              names+=("${e##*/}")
+            done
+            printf '%s\n' "${names[@]:-}" | LC_ALL=C sort | tr '\n' ' '
+          }
+          fail() {
+            echo "::error::trial-check-forced: $1"
+            exit 1
+          }
+          # 1. The artifact holds exactly the zip and its checksum.
+          listing=$(list_dir out)
+          [ "$listing" = "$PKG.zip $PKG.zip.sha256 " ] || fail "out holds '$listing', expected $PKG.zip and $PKG.zip.sha256"
+          # 2. Every entry of the zip is under PKG/: the only top-level entry is PKG/. (7z on Windows prints backslashes.)
+          entries=$(7z l -ba -slt "out/$PKG.zip" | sed -n 's/^Path = //p' | tr -d '\r' | tr '\134' '/')
+          [ -n "$entries" ] || fail "the zip lists no entries"
+          while IFS= read -r entry; do
+            case "$entry" in
+              "$PKG" | "$PKG"/*) ;;
+              *) fail "zip entry '$entry' is not under $PKG/" ;;
+            esac
+          done <<< "$entries"
+          # 3. The extracted files equal the input files: same paths, same SHA-256.
+          rm -rf x
+          mkdir x
+          7z x "out/$PKG.zip" -ox -y > /dev/null
+          [ "$(list_dir x)" = "$PKG " ] || fail "the zip does not extract to a single $PKG/ folder"
+          manifest() {
+            (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+          }
+          manifest "unsigned/$PKG" > in.txt
+          manifest "x/$PKG" > zip.txt
+          [ -s in.txt ] || fail "the input package holds no files"
+          diff in.txt zip.txt || fail "the extracted files differ from the input files"
+          # 4. The checksum file passes.
+          (cd out && sha256sum -c "$PKG.zip.sha256")
+          echo "case 1 ok: $(wc -l < in.txt) files, layout $PKG/, checksum passes"
+
+      # Skip mode signs nothing: the own file in the zip is NotSigned and byte-equal to the input.
+      - name: Assert the own file is unsigned and unchanged
+        shell: pwsh
+        env:
+          PKG: selftest-0.0.0-win-x64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inFile = Join-Path 'unsigned' "$env:PKG/selftest.exe"
+          $zipFile = Join-Path 'x' "$env:PKG/selftest.exe"
+          $sig = Get-AuthenticodeSignature -LiteralPath $zipFile
+          if ($sig.Status -ne 'NotSigned') {
+            Write-Host "::error::trial-check-forced: selftest.exe in the zip has signature status $($sig.Status), expected NotSigned"
+            exit 1
+          }
+          $a = (Get-FileHash -Algorithm SHA256 -LiteralPath $inFile).Hash
+          $b = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipFile).Hash
+          if ($a -ne $b) {
+            Write-Host "::error::trial-check-forced: selftest.exe in the zip ($b) differs from the input ($a)"
+            exit 1
+          }
+          Write-Host "own file ok: NotSigned and byte-equal to the input ($a)"
+
+      # The called workflow has no outputs, so the mode it took is read from the warning annotation of its sign leg, in
+      # the CURRENT run attempt. GitHub has no API for a job summary: the banner text is proven at step level (E3.A3).
+      - name: Assert the forced call warned UNSIGNED RELEASE
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEG_SUFFIX: '/ sign selftest-forced-win-x64'
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::trial-check-forced: $1"
+            exit 1
+          }
+          jobs_path="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100"
+          found=
+          for attempt in 1 2 3 4 5; do
+            ids=$(gh api "$jobs_path" --jq ".jobs[] | select(.name | endswith(\"$LEG_SUFFIX\")) | .id" | tr -d '\r') ||
+              fail "the GitHub API call for the jobs of this run attempt failed"
+            [ -n "$ids" ] || fail "no job of this run attempt has a name ending '$LEG_SUFFIX'"
+            [ "$(printf '%s\n' "$ids" | wc -l)" -eq 1 ] || fail "more than one job has a name ending '$LEG_SUFFIX'"
+            warnings=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$ids/annotations?per_page=100" \
+              --jq '.[] | select(.annotation_level == "warning" and (.message | startswith("sign-windows: UNSIGNED RELEASE"))) | .message' | tr -d '\r') ||
+              fail "the GitHub API call for the annotations of check run $ids failed"
+            if [ -n "$warnings" ]; then
+              found=yes
+              echo "annotation found: $warnings"
+              break
+            fi
+            echo "attempt $attempt of 5: the sign leg has no 'sign-windows: UNSIGNED RELEASE' warning yet"
+            if [ "$attempt" -lt 5 ]; then
+              sleep 10
+            fi
+          done
+          [ -n "$found" ] || fail "the sign leg (check run $ids) has no warning annotation starting 'sign-windows: UNSIGNED RELEASE'"
+
+  # One required check. A skipped job can count as a pass for a required check, and a check job is skipped when its call
+  # fails; this job is red unless every other job succeeded.
+  all-green:
+    name: ci · all green
+    if: always()
+    needs: [lint, harness, trial-input, trial-call, trial-check, trial-call-forced, trial-check-forced]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to be green
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS" > /dev/null; then
+            echo "::error::all-green: not every job of this run succeeded"
+            exit 1
+          fi
