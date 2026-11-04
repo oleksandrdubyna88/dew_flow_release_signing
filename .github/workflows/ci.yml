@@ -69,12 +69,13 @@ jobs:
           ./test/selftest.ps1
 
       # The harness sets the environment of a step itself, so it cannot see the workflow's env: block. This check pins
-      # the SOURCE of the allow-unsigned-release mapping, which neither the harness nor the two real calls can see.
+      # the SOURCE of the allow-unsigned-release mapping, which neither the harness nor the two real calls can see. It
+      # also pins that all-green needs every other job of this file.
       - name: Check the wiring of allow-unsigned-release
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node test/wiring.mjs .github/workflows/sign-windows.yml
+          node test/wiring.mjs .github/workflows/sign-windows.yml .github/workflows/ci.yml
           if ($LASTEXITCODE -ne 0) { throw "wiring.mjs exited $LASTEXITCODE" }
 
   # The package for both real calls of sign-windows.yml: trial-call (case 1, the unsigned trial road) and

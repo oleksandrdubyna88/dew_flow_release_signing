@@ -1,7 +1,9 @@
-// Usage: node test/wiring.mjs <workflow.yml>
+// Usage: node test/wiring.mjs <sign-windows.yml> <ci.yml>
 // Pins how the allow-unsigned-release input reaches the mode step. The self-test harness builds the step's
 // environment itself, and the two real calls of ci.yml cannot tell the input from a wrong source (trial-call-forced is
 // permitted either way, trial-call is not forced), so the SOURCE of the mapping is checked here, on the parsed YAML.
+// It also checks that the all-green gate of ci.yml needs exactly every other job: a job missing from its needs: list
+// would not be gated.
 // Exit codes:
 //   0  the wiring is as pinned (prints "wiring ok: ...")
 //   1  a pinned fact does not hold (each one is printed)
@@ -10,19 +12,26 @@
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 
-const [file] = process.argv.slice(2);
-if (!file || process.argv.length !== 3) {
-  console.error('usage: node test/wiring.mjs <workflow.yml>');
+const [file, ciFile] = process.argv.slice(2);
+if (!file || !ciFile || process.argv.length !== 4) {
+  console.error('usage: node test/wiring.mjs <sign-windows.yml> <ci.yml>');
   process.exit(64);
 }
 
 let text;
 let doc;
+let ciDoc;
 try {
   text = readFileSync(file, 'utf8');
   doc = parse(text);
 } catch (err) {
   console.error(`wiring: cannot read ${file}: ${err.message}`);
+  process.exit(2);
+}
+try {
+  ciDoc = parse(readFileSync(ciFile, 'utf8'));
+} catch (err) {
+  console.error(`wiring: cannot read ${ciFile}: ${err.message}`);
   process.exit(2);
 }
 
@@ -64,8 +73,24 @@ if (readers.length !== 1) {
   problems.push(`${readers.length} expressions name allow-unsigned-release, expected exactly one (the mode step's env)`);
 }
 
+// 4. The gate: ci.yml's all-green job needs exactly every other job (order does not matter).
+const ciJobs = Object.keys(ciDoc?.jobs ?? {});
+const gate = ciDoc?.jobs?.['all-green'];
+if (!gate) {
+  problems.push(`${ciFile} has no job 'all-green'`);
+} else {
+  const rawNeeds = gate.needs ?? [];
+  const needs = Array.isArray(rawNeeds) ? rawNeeds : [rawNeeds];
+  const others = ciJobs.filter((j) => j !== 'all-green');
+  const missing = others.filter((j) => !needs.includes(j));
+  const extra = needs.filter((j) => !others.includes(j));
+  if (missing.length > 0) problems.push(`all-green does not need: ${missing.join(', ')} (a job outside the gate)`);
+  if (extra.length > 0) problems.push(`all-green needs jobs that do not exist or are itself: ${extra.join(', ')}`);
+  if (new Set(needs).size !== needs.length) problems.push('all-green needs lists a job twice');
+}
+
 if (problems.length > 0) {
   for (const p of problems) console.error(`wiring: ${p}`);
   process.exit(1);
 }
-console.log('wiring ok: mode reads allow-unsigned-release from the input only');
+console.log('wiring ok: mode reads allow-unsigned-release from the input only; all-green needs every other job');
