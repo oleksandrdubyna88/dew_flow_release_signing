@@ -8,7 +8,8 @@
     pwsh -NoLogo -NoProfile -NonInteractive -Command ". '<file>'"   (actions/runner ScriptHandlerHelpers).
   - shell bash: Git Bash by full path, never a bare `bash` (which may be WSL's), as
     bash --noprofile --norc -eo pipefail <file>
-  - GITHUB_OUTPUT is a fresh temp file per step; the working directory is the case's tree.
+  - GITHUB_OUTPUT and GITHUB_STEP_SUMMARY are fresh temp files per step (a case can unset the summary variable or point it
+    at a directory with Env GITHUB_STEP_SUMMARY = '<unset>' or '<dir>'); the working directory is the case's tree.
   - Fixtures are made at run time (test/fixtures/make-fixtures.ps1) in a run folder whose path CONTAINS A SPACE;
     the folder is removed at the end.
 
@@ -33,7 +34,7 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 # Child processes. The exit code is read from the process object itself, so nothing can overwrite it.
 # ---------------------------------------------------------------------------------------------------------------
 $cleanEnvRe = '^(GITHUB_|ACTIONS_|AZURE_|SIGNING_|INPUT_)'
-$cleanEnvNames = @('REQUIRED', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR', 'PKG', 'MODE', 'FILES', 'KEPT_FILES', 'VERIFIED_MANIFEST')
+$cleanEnvNames = @('REQUIRED', 'ALLOW_UNSIGNED_RELEASE', 'ENVIRONMENT', 'ARTIFACT', 'ARTIFACTS', 'OWN_FILES', 'EXTRA_FILES', 'PKG_DIR', 'PKG_NAME', 'IN_DIR', 'PKG', 'MODE', 'FILES', 'KEPT_FILES', 'VERIFIED_MANIFEST')
 
 function Invoke-Child {
   param([string]$File, [string[]]$Arguments, [string]$WorkDir, [hashtable]$ChildEnv = @{})
@@ -67,13 +68,25 @@ function Invoke-WorkflowStep {
   param([string]$WorkflowFile, [string]$StepId, [string]$CaseDir, [hashtable]$StepEnv, [string]$ScratchDir)
   $def = Invoke-Child -File $nodeExe -Arguments @($runStep, $WorkflowFile, $StepId) -WorkDir $CaseDir
   if ($def.ExitCode -ne 0) {
-    return [pscustomobject]@{ ExitCode = $def.ExitCode; Output = $def.Output; Outputs = @{}; OutputText = ''; RunStepFailed = $true }
+    return [pscustomobject]@{ ExitCode = $def.ExitCode; Output = $def.Output; Outputs = @{}; OutputText = ''; SummaryText = ''; RunStepFailed = $true }
   }
   $step = ConvertFrom-Json -InputObject ($def.Output.Trim())
   $outFile = Join-Path $ScratchDir ("gh-output-" + [guid]::NewGuid().ToString('N') + '.txt')
   [System.IO.File]::WriteAllText($outFile, '', $utf8)
+  # GITHUB_STEP_SUMMARY: a fresh empty file, unless the case says '<unset>' (variable absent) or '<dir>' (a directory).
+  $sumFile = Join-Path $ScratchDir ("gh-summary-" + [guid]::NewGuid().ToString('N') + '.txt')
+  $sumMode = if ($StepEnv.ContainsKey('GITHUB_STEP_SUMMARY')) { [string]$StepEnv['GITHUB_STEP_SUMMARY'] } else { '' }
   $envFor = @{} + $StepEnv
   $envFor['GITHUB_OUTPUT'] = $outFile
+  if ($sumMode -eq '<unset>') {
+    $envFor.Remove('GITHUB_STEP_SUMMARY')
+  } elseif ($sumMode -eq '<dir>') {
+    $null = New-Item -ItemType Directory -Path $sumFile
+    $envFor['GITHUB_STEP_SUMMARY'] = $sumFile
+  } else {
+    [System.IO.File]::WriteAllText($sumFile, '', $utf8)
+    $envFor['GITHUB_STEP_SUMMARY'] = $sumFile
+  }
   $text = $step.run -replace "`r`n", "`n"
   if ($step.shell -eq 'pwsh') {
     $file = Join-Path $ScratchDir ("step-" + [guid]::NewGuid().ToString('N') + '.ps1')
@@ -89,7 +102,8 @@ function Invoke-WorkflowStep {
     throw "step '$StepId' has shell '$($step.shell)'; the harness knows pwsh and bash"
   }
   $outputText = [System.IO.File]::ReadAllText($outFile)
-  return [pscustomobject]@{ ExitCode = $res.ExitCode; Output = $res.Output; Outputs = (Read-GithubOutput $outputText); OutputText = $outputText; RunStepFailed = $false }
+  $summaryText = if (Test-Path -LiteralPath $sumFile -PathType Leaf) { [System.IO.File]::ReadAllText($sumFile) } else { '' }
+  return [pscustomobject]@{ ExitCode = $res.ExitCode; Output = $res.Output; Outputs = (Read-GithubOutput $outputText); OutputText = $outputText; SummaryText = $summaryText; RunStepFailed = $false }
 }
 
 # GITHUB_OUTPUT: `name=value` lines and `name<<DELIM` ... `DELIM` blocks.
@@ -161,7 +175,9 @@ function Expand-Text([string]$Text, [string]$PkgDir) {
 
 # One case: a fresh tree, then one step (the case itself) or a chain of steps (Case.Steps) run in that tree.
 # In a chain the outputs of pkg, mode and inventory reach the later steps as env, as the workflow's env: does.
-# Step keys: Step, Env, Exit, Expect, NoOutput, Outputs, Prepare (scriptblock run before the step).
+# Step keys: Step, Env, Exit, Expect, NoOutput, Outputs, Summary (fragments the job summary file must hold), NoSummary
+# (the job summary file must be empty), Prepare (scriptblock run before the step). A case that names neither Summary nor
+# NoSummary does not check the summary file.
 # Returns $null when every assertion holds, else the reason.
 $caseCounter = 0
 function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
@@ -220,6 +236,13 @@ function Test-StepRun($Case, $Tree, [string]$WorkflowFile) {
         if ($r.Outputs[$name] -ine $want) { $problems.Add("output '$name' is '$($r.Outputs[$name] -replace "`n", ' | ')', expected '$($want -replace "`n", ' | ')'") }
       }
     }
+    foreach ($frag in @($spec.Summary)) {
+      if ($frag) {
+        $want = Expand-Text ([string]$frag) $pkgDir
+        if ($r.SummaryText.IndexOf($want, [System.StringComparison]::Ordinal) -lt 0) { $problems.Add("summary lacks '$want'") }
+      }
+    }
+    if ($spec.NoSummary -and $r.SummaryText.Trim() -ne '') { $problems.Add("summary was written but none expected: $($r.SummaryText.Trim() -replace "`n", ' | ')") }
     if ($problems.Count -gt 0) {
       return "step '$($spec.Step)': " + ($problems -join '; ') + " [output: " + (($r.Output.Trim() -replace '\s*\r?\n\s*', ' / ')) + "]"
     }
@@ -249,6 +272,14 @@ foreach ($v in $sixVars) { if ($v -ne 'SIGNING_PUBLISHER') { $fifthMissing[$v] =
 $fifthMissing['REQUIRED'] = 'true'
 $allSix = @{}
 foreach ($v in $sixVars) { $allSix[$v] = 'x' }
+
+# The first N of the six variables set to x (a partial configuration), and five of six (not SIGNING_PUBLISHER).
+function Get-FirstSix([int]$Count) {
+  $h = @{}
+  foreach ($v in ($sixVars | Select-Object -First $Count)) { $h[$v] = 'x' }
+  return $h
+}
+$fiveSet = Get-FirstSix 5
 
 # 200 and 199 declared copies of an unsigned PE, for the bound on the signing list.
 $manyExtras = @{}
@@ -376,6 +407,43 @@ $cases = @(
   # Added by the implementation: the two green paths no listed case reaches.
   @{ Id = 'X.pkg-ok'; Step = 'pkg'; Exit = 0; Expect = @('package: '); Outputs = @{ name = 'pkg'; dir = '{PKG}' } }
   @{ Id = 'X.inputs-ok'; Step = 'inputs'; Exit = 0; Expect = @('inputs ok: 1 artifacts, 1 own files, 0 extra-file globs') }
+  # E3: allow-unsigned-release (AUR = ALLOW_UNSIGNED_RELEASE). Zero variables on a forced leg with the permission packs unsigned,
+  # with a warning and a banner in the job summary; every other row is unchanged.
+  @{ Id = '10'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' }; Exit = 0
+     Expect = @('::warning::sign-windows: UNSIGNED RELEASE', "environment 'release-signing'", 'caller ref refs/tags/x', 'cli-win-x64 is packed unsigned')
+     Outputs = @{ mode = 'skip' }; Summary = @('UNSIGNED RELEASE') }
+  @{ Id = '11'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'false' }; Exit = 1
+     Expect = @('signing is required', 'refs/tags/x', "SIGNING_PUBLISHER is set in environment 'release-signing'"); NoOutput = $true; NoSummary = $true }
+  @{ Id = '12'; Step = 'mode'; Env = @{ AZURE_CLIENT_ID = 'x'; GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' }; Exit = 1
+     Expect = @('partial signing configuration', 'set AZURE_CLIENT_ID', 'missing AZURE_TENANT_ID'); NoOutput = $true; NoSummary = $true }
+  @{ Id = '13'; Step = 'mode'; Env = (@{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' } + $allSix); Exit = 0
+     Expect = @('mode: sign'); Outputs = @{ mode = 'sign' }; NoSummary = $true }
+  @{ Id = 'E3.A1'; Step = 'mode'; Env = (@{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' } + $fiveSet); Exit = 1
+     Expect = @('partial signing configuration', 'missing SIGNING_PUBLISHER'); NoOutput = $true; NoSummary = $true }
+  @{ Id = 'E3.A2'; Step = 'mode'; Env = @{ REQUIRED = 'true'; ALLOW_UNSIGNED_RELEASE = 'true' }; Exit = 0
+     Expect = @('UNSIGNED RELEASE', 'required=true', 'caller ref refs/heads/main'); Outputs = @{ mode = 'skip' }; Summary = @('UNSIGNED RELEASE') }
+  @{ Id = 'E3.A3'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' }; Exit = 0
+     Expect = @('UNSIGNED RELEASE'); Outputs = @{ mode = 'skip' }
+     Summary = @('## UNSIGNED RELEASE', '`cli-win-x64` is packed **unsigned**', 'environment `release-signing`', 'caller ref `refs/tags/x`', 'the caller removes the `allow-unsigned-release` input') }
+  # Only the exact string true permits.
+  @{ Id = 'E3.A4'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = '1' }; Exit = 1
+     Expect = @('signing is required'); NoOutput = $true; NoSummary = $true }
+  # A trial is not a release: no banner.
+  @{ Id = 'E3.A5'; Step = 'mode'; Env = @{ ALLOW_UNSIGNED_RELEASE = 'true' }; Exit = 0
+     Expect = @('UNSIGNED trial'); Outputs = @{ mode = 'skip' }; NoSummary = $true }
+  # Row 3r: the banner cannot be written, so the unsigned release is not packed.
+  @{ Id = 'E3.A6'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true'; GITHUB_STEP_SUMMARY = '<unset>' }; Exit = 1
+     Expect = @('GITHUB_STEP_SUMMARY is not set'); NoOutput = $true; NoSummary = $true }
+  # The append fails (the summary path is a directory): red under set -euo pipefail, and no mode=skip is left behind.
+  @{ Id = 'E3.A7'; Step = 'mode'; Env = @{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true'; GITHUB_STEP_SUMMARY = '<dir>' }; Exit = 1
+     Expect = @('Is a directory'); NoOutput = $true }
+  # Every partial count is red with the permission on: two, three and four set (one is case 12, five is E3.A1).
+  @{ Id = 'E3.A8'; Step = 'mode'; Exit = 1; Expect = @('partial signing configuration'); NoOutput = $true; NoSummary = $true
+     Envs = @(
+       (@{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' } + (Get-FirstSix 2)),
+       (@{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' } + (Get-FirstSix 3)),
+       (@{ GITHUB_REF = 'refs/tags/x'; ALLOW_UNSIGNED_RELEASE = 'true' } + (Get-FirstSix 4))
+     ) }
 )
 
 # E1.A5: run-step.mjs refuses a workflow with `${{` inside a run: block, and names the step.
@@ -426,8 +494,12 @@ try {
     $reason = $null
     try {
       $trees = if ($case.Trees) { @($case.Trees) } elseif ($case.Tree) { @($case.Tree) } else { @($defaultTree) }
+      $variants = if ($case.Envs) { @($case.Envs | ForEach-Object { $c = $case.Clone(); $c.Env = $_; $c }) } else { @($case) }
       foreach ($tree in $trees) {
-        $reason = Test-StepRun $case $tree $workflowPath
+        foreach ($variant in $variants) {
+          $reason = Test-StepRun $variant $tree $workflowPath
+          if ($reason) { break }
+        }
         if ($reason) { break }
       }
     } catch {
