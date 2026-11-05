@@ -4,6 +4,6 @@
   "type": "module",
   "description": "Test harness of the sign-windows workflow. Not published.",
   "dependencies": {
-    "yaml": "2.8.4"
+    "yaml": "2.9.1"
   }
 }
